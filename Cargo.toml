@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "nddev-device-sync-observability"
-version = "0.0.1-alpha.1"
+version = "0.0.1-alpha.2"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -18,7 +18,6 @@ axum = "0.8.9"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-jsonschema = { version = "0.58.6", default-features = false }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }

@@ -1,7 +1,7 @@
 pub mod application;
 pub mod config;
 pub mod domain;
-pub mod event_wire;
+pub use nddev_device_sync_telemetry::event as event_wire;
 pub mod http;
 pub mod normalize;
 pub mod runtime;

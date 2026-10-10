@@ -2,9 +2,9 @@
 use nddev_device_sync_telemetry::{Config, DebugWindow, install, operation_span};
 use std::time::Duration;
 fn main() {
-    let logger = install(Config {
+    let mut logger = install(Config {
         service: "sdk-acceptance".into(),
-        version: "0.0.1-alpha.1".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
         repository: "NDDev-OpenNetwork/nddev-device-sync-observability".into(),
         commit: "unknown".into(),
         channel: "alpha".into(),
@@ -19,6 +19,34 @@ fn main() {
         }),
     })
     .expect("owned valid config");
+    if std::env::args().nth(1).as_deref() == Some("--panic") {
+        panic!("SYNTHETIC_PRIVATE_PANIC /private/example token=do-not-emit");
+    }
+    if std::env::args().nth(1).as_deref() == Some("--shutdown-race") {
+        let control = logger.control.clone();
+        let barrier = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..4096 {
+                        tracing::info!(event.name = "race.operation", outcome = "ok");
+                    }
+                });
+            }
+            barrier.wait();
+            logger.shutdown();
+        });
+        logger.shutdown(); // A repeated controlled exit emits no second terminal event.
+        let health = control.output_health();
+        assert!(health.terminating && !health.shutdown_incomplete);
+        assert_eq!(health.pending_events, 0);
+        eprintln!(
+            "{{\"dropped\":{},\"pending\":0,\"attempted\":32772}}",
+            health.dropped_events
+        );
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--blocked-stdout") {
         for _ in 0..4096 {
             tracing::warn!(event.name = "owned.operation.completed", outcome = "ok");
@@ -40,6 +68,13 @@ fn main() {
             dropped, elapsed
         );
         return;
+    }
+    for kind in [
+        nddev_device_sync_telemetry::view::FailureKind::FlutterFramework,
+        nddev_device_sync_telemetry::view::FailureKind::DartUnhandled,
+        nddev_device_sync_telemetry::view::FailureKind::NativeBridge,
+    ] {
+        logger.control.report_failure(kind);
     }
     std::thread::scope(|scope| {
         for _ in 0..8 {

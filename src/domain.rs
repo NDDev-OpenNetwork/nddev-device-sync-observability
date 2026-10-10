@@ -119,8 +119,8 @@ pub fn condition(
         }
         ("tls.reload.failed", _, _, _) => Some(("tls", Condition::Failed)),
         ("tls.reload.completed", _, _, _) => Some(("tls", Condition::Recovered)),
-        ("process.failed", _, _, _) => Some(("process", Condition::Failed)),
-        ("server.started", _, _, _) => Some(("process", Condition::Recovered)),
+        ("process.failed" | "client.failure", _, _, _) => Some(("process", Condition::Failed)),
+        ("server.started" | "client.ready", _, _, _) => Some(("process", Condition::Recovered)),
         _ => None,
     }
 }
@@ -164,6 +164,16 @@ mod tests {
 
     #[test]
     fn unrelated_success_cannot_resolve_a_database_incident() {
+        assert_eq!(
+            condition("client.failure", None, None, None),
+            Some(("process", Condition::Failed))
+        );
+        assert_eq!(condition("process.started", None, None, None), None);
+        assert_eq!(condition("client.resumed", None, None, None), None);
+        assert_eq!(
+            condition("client.ready", None, None, None),
+            Some(("process", Condition::Recovered))
+        );
         assert_eq!(
             condition(
                 "http.request.completed",
