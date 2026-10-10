@@ -9,7 +9,7 @@ use std::{
     fmt,
     io::Write,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -28,10 +28,14 @@ use tracing_subscriber::{
 
 mod output;
 pub use output::{LocalWriter, OutputHealth};
+mod http;
+pub use http::{finish_http_server_span, http_server_span};
 
 pub const MAX_EVENT_BYTES: usize = 16_384;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 const SCHEMA: &str = include_str!("../telemetry-event.schema.json");
+static CONTRACT: LazyLock<Value> =
+    LazyLock::new(|| serde_json::from_str(SCHEMA).expect("embedded telemetry schema"));
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid telemetry configuration or unavailable subscriber")]
@@ -79,10 +83,10 @@ impl Policy {
         {
             return Err(Error);
         }
-        let source: Value = serde_json::from_str(SCHEMA).map_err(|_| Error)?;
+        let source = &*CONTRACT;
         let schema = jsonschema::options()
             .should_validate_formats(true)
-            .build(&source)
+            .build(source)
             .map_err(|_| Error)?;
         let base: Map<_, _> = [
             ("service.name", &config.service),
@@ -152,6 +156,7 @@ struct Fields {
 struct Visitor<'a> {
     fields: &'a mut Fields,
     policy: &'a Policy,
+    sdk_http_span: bool,
 }
 impl Visitor<'_> {
     fn insert(&mut self, field: &Field, value: Value) {
@@ -162,6 +167,11 @@ impl Visitor<'_> {
         }
     }
     fn text(&mut self, field: &Field, text: &str) {
+        // The SDK's HTTP constructor owns this constant OTel transport field.
+        // It is not an event field and grants no other attribute an exemption.
+        if self.sdk_http_span && field.name() == "otel.kind" && text == "server" {
+            return;
+        }
         if !self.policy.writable(field.name()) {
             self.fields.rejected += 1;
             return;
@@ -381,6 +391,8 @@ where
             attrs.record(&mut Visitor {
                 fields: &mut fields,
                 policy: &self.shared.policy,
+                sdk_http_span: attrs.metadata().target() == "nds_telemetry"
+                    && attrs.metadata().name() == "http.request",
             });
             span.extensions_mut().insert(fields);
         }
@@ -392,6 +404,7 @@ where
             record.record(&mut Visitor {
                 fields,
                 policy: &self.shared.policy,
+                sdk_http_span: false,
             });
         }
     }
@@ -419,6 +432,7 @@ where
         event.record(&mut Visitor {
             fields: &mut fields,
             policy: &self.shared.policy,
+            sdk_http_span: false,
         });
         let scope = fields
             .values
@@ -682,7 +696,28 @@ pub fn trace_context(span: &tracing::Span) -> Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::{SpanContext, SpanKind, Status, TraceFlags};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{Span as NativeSpan, SpanData, SpanProcessor},
+    };
     use std::io;
+    #[derive(Clone, Debug, Default)]
+    struct CompletedSpans(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanProcessor for CompletedSpans {
+        fn on_start(&self, _: &mut NativeSpan, _: &Context) {}
+        fn on_end(&self, span: SpanData) {
+            let mut spans = self.0.lock().unwrap();
+            assert!(spans.len() < 16);
+            spans.push(span);
+        }
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(&self, _: Duration) -> OTelSdkResult {
+            Ok(())
+        }
+    }
     #[derive(Clone)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
     impl Write for Capture {
@@ -774,6 +809,179 @@ mod tests {
         assert_eq!(values[0]["trace_id"], values[1]["trace_id"]);
         assert_ne!(values[0]["span_id"], values[1]["span_id"]);
         assert_eq!(values[1]["module"], "sysinfo");
+    }
+    #[test]
+    fn http_spans_preserve_native_parent_kind_status_and_closed_events() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let completed = CompletedSpans::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(completed.clone())
+            .build();
+        let (subscriber, control) =
+            subscriber(config(), Capture(bytes.clone()), provider.tracer("test")).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = operation_span("accounts", "http").unwrap();
+            let id = trace_context(&parent).span().span_context().clone();
+            let context = SpanContext::new(
+                id.trace_id(),
+                id.span_id(),
+                id.trace_flags(),
+                true,
+                id.trace_state().clone(),
+            );
+            drop(parent);
+            // Only an immutable parent identity survives; request duration is
+            // not extended by a live parent span in a later operation.
+            assert_eq!(completed.0.lock().unwrap().len(), 1);
+            for status in [400, 500] {
+                let request = http_server_span("POST", "/v2/devices/{device_id}").unwrap();
+                request
+                    .set_parent(Context::new().with_remote_span_context(context.clone()))
+                    .unwrap();
+                request.in_scope(|| {
+                    finish_http_server_span(&request, status).unwrap();
+                    tracing::error!(
+                        event.name = "http.request.completed",
+                        error.type = "request_rejected",
+                        outcome = "error"
+                    );
+                });
+            }
+        });
+        provider.force_flush().unwrap();
+        let spans = completed.0.lock().unwrap();
+        assert_eq!(spans.len(), 3);
+        let parent = &spans[0];
+        for (span, status) in spans[1..].iter().zip([400, 500]) {
+            assert_eq!(span.span_kind, SpanKind::Server);
+            assert_eq!(span.parent_span_id, parent.span_context.span_id());
+            assert_eq!(span.span_context.trace_id(), parent.span_context.trace_id());
+            assert!(span.parent_span_is_remote);
+            assert_eq!(
+                span.status,
+                if status == 500 {
+                    Status::error("")
+                } else {
+                    Status::Unset
+                }
+            );
+            for (key, value) in [
+                ("http.request.method", opentelemetry::Value::from("POST")),
+                (
+                    "http.route",
+                    opentelemetry::Value::from("/v2/devices/{device_id}"),
+                ),
+                (
+                    "http.response.status_code",
+                    opentelemetry::Value::from(status),
+                ),
+            ] {
+                assert!(
+                    span.attributes
+                        .iter()
+                        .any(|v| v.key.as_str() == key && v.value == value)
+                );
+            }
+        }
+        let values = records(&bytes);
+        assert_eq!(values.len(), 2);
+        for (value, span) in values.iter().zip(&spans[1..]) {
+            assert_eq!(value["trace_id"], span.span_context.trace_id().to_string());
+            assert_eq!(value["span_id"], span.span_context.span_id().to_string());
+            assert_eq!(value["module"], "http");
+            assert_eq!(value["scope"], "http");
+            assert_eq!(value["method"], "POST");
+            assert_eq!(value["route"], "/v2/devices/{device_id}");
+        }
+        assert_eq!(values[0]["status"], 400);
+        assert_eq!(values[1]["status"], 500);
+        assert_eq!(control.rejected_fields_or_events(), 0);
+    }
+    #[test]
+    fn unsampled_http_parent_never_suppresses_local_security_or_error_events() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let completed = CompletedSpans::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(completed.clone())
+            .build();
+        let (subscriber, control) =
+            subscriber(config(), Capture(bytes.clone()), provider.tracer("test")).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = operation_span("accounts", "http").unwrap();
+            let id = trace_context(&parent).span().span_context().clone();
+            drop(parent);
+            let unsampled = SpanContext::new(
+                id.trace_id(),
+                id.span_id(),
+                TraceFlags::NOT_SAMPLED,
+                true,
+                id.trace_state().clone(),
+            );
+            let request = http_server_span("OTHER", "unmatched").unwrap();
+            request
+                .set_parent(Context::new().with_remote_span_context(unsampled))
+                .unwrap();
+            assert!(!trace_context(&request).span().span_context().is_sampled());
+            request.in_scope(|| {
+                tracing::warn!(event.name = "security.request.rejected", outcome = "rejected");
+                finish_http_server_span(&request, 503).unwrap();
+                tracing::error!(event.name = "http.request.completed", error.type = "server_busy", outcome = "error");
+            });
+        });
+        provider.force_flush().unwrap();
+        assert_eq!(completed.0.lock().unwrap().len(), 1);
+        let values = records(&bytes);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["event.name"], "security.request.rejected");
+        assert_eq!(values[1]["status"], 503);
+        assert_eq!(values[0]["trace_id"], values[1]["trace_id"]);
+        assert_eq!(values[0]["span_id"], values[1]["span_id"]);
+        assert_eq!(values[0]["method"], "OTHER");
+        assert_eq!(values[0]["route"], "unmatched");
+        assert_eq!(control.rejected_fields_or_events(), 0);
+    }
+    #[test]
+    fn http_boundaries_and_transport_metadata_do_not_bypass_event_projection() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder().build();
+        let (subscriber, control) =
+            subscriber(config(), Capture(bytes.clone()), provider.tracer("test")).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            for route in [
+                "",
+                "/v2/auth?token=generated",
+                "/v2/\n",
+                "https://example.invalid/",
+            ] {
+                assert!(http_server_span("POST", route).is_err());
+            }
+            assert!(http_server_span("GET", &format!("/{}", "a".repeat(256))).is_err());
+            assert!(http_server_span("get", "/source").is_err());
+            let request = http_server_span("GET", "/source").unwrap();
+            assert!(finish_http_server_span(&request, 99).is_err());
+            assert!(finish_http_server_span(&request, 600).is_err());
+            request.in_scope(|| {
+                tracing::warn!(
+                    event.name = "security.rejected",
+                    outcome = "rejected",
+                    otel.kind = "server",
+                    otel.status_description = "generated forbidden prose"
+                );
+            });
+        });
+        let values = records(&bytes);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["event.name"], "logging.fields.rejected");
+        assert_eq!(values[0]["rejected_count"], 2);
+        assert_eq!(values[1]["event.name"], "security.rejected");
+        assert!(
+            !values[1]
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|key| key.starts_with("otel."))
+        );
+        assert_eq!(control.rejected_fields_or_events(), 2);
     }
     #[test]
     fn concurrent_writes_are_complete_ordered_and_debug_budget_is_finite() {
