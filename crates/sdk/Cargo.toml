@@ -16,3 +16,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 tracing-opentelemetry = { version = "0.34.0", default-features = false }
 thiserror = "2.0"
 uuid = { version = "1.27", features = ["v4"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_log-sys = "=0.3.2"
