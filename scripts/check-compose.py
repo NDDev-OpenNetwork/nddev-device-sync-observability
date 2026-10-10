@@ -74,6 +74,11 @@ def eventually(predicate,seconds=45):
     raise AssertionError('bounded acceptance condition timed out')
 
 def main():
+    # Docker 28.2 introduced the finite Fluent write timeout. Refuse an older
+    # engine before building images or creating any ephemeral runtime state.
+    version=command('docker','version','--format','{{.Server.Version}}',timeout=10).stdout.strip()
+    parts=re.match(r'^(\d+)\.(\d+)\.(\d+)',version)
+    assert parts and tuple(map(int,parts.groups())) >= (28,2,0), 'Docker Engine >=28.2.0 is required for bounded Fluent writes'
     project='nds-obs-test-'+secrets.token_hex(5)
     with tempfile.TemporaryDirectory(prefix='nds-obs-acceptance-') as temp:
         directory=pathlib.Path(temp);private=directory/'secrets';private.mkdir(mode=0o700)

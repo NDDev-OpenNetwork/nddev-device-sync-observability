@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -54,6 +54,10 @@ jobs:
           cargo install cargo-deny --version 0.20.2 --locked
           cargo audit
           cargo deny check licenses sources
+      - name: Install bounded Fluent transport support
+        uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5.5.0
+        with:
+          version: v29.9.0
       - name: Verify real pipeline and durable incident lifecycle
         env:
           NDS_SERVER_SOURCE_DIR: ${{ github.workspace }}/.server-acceptance-source
