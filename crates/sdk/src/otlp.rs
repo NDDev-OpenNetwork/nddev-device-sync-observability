@@ -99,6 +99,15 @@ impl SpanProcessor for BoundedProcessor {
         // exception prose, baggage, links and identity labels are never exported.
         span.events.events.clear();
         span.links.links.clear();
+        // W3C trace IDs preserve causality. Vendor tracestate is arbitrary
+        // remote input and is outside the canonical public attribute projection.
+        span.span_context = opentelemetry::trace::SpanContext::new(
+            span.span_context.trace_id(),
+            span.span_context.span_id(),
+            span.span_context.trace_flags(),
+            span.span_context.is_remote(),
+            opentelemetry::trace::TraceState::default(),
+        );
         if !matches!(span.name.as_ref(), "http.request" | "module.operation") {
             span.name = "module.operation".into();
         }
