@@ -2,6 +2,10 @@
 use nddev_device_sync_telemetry::{
     Config, finish_http_server_span, http_server_span, otlp::NativeTraces,
 };
+use opentelemetry::{
+    Context,
+    trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
+};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 use std::{
@@ -10,6 +14,7 @@ use std::{
     sync::atomic::Ordering,
     time::Duration,
 };
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 fn config() -> Config {
     Config {
@@ -81,6 +86,14 @@ fn actual_http_otlp_retries_and_exports_only_projected_native_spans() {
             .unwrap();
     tracing::subscriber::with_default(subscriber, || {
         let span = http_server_span("GET", "/v1/health").unwrap();
+        span.set_parent(Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_bytes([7; 16]),
+            SpanId::from_bytes([8; 8]),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::from_key_value([("private", "PRIVATE_TRACE_VALUE")]).unwrap(),
+        )))
+        .unwrap();
         span.in_scope(|| {
             tracing::event!(target:"nds_acceptance",tracing::Level::INFO,{event.name="acceptance.completed",outcome="ok"});
             finish_http_server_span(&span, 200).unwrap();
@@ -91,6 +104,9 @@ fn actual_http_otlp_retries_and_exports_only_projected_native_spans() {
     let spans = &received.resource_spans[0].scope_spans[0].spans;
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].name, "http.request");
+    assert!(spans[0].trace_state.is_empty());
+    assert_eq!(spans[0].trace_id, vec![7; 16]);
+    assert_eq!(spans[0].parent_span_id, vec![8; 8]);
     assert_eq!(spans[0].kind, 2); // Native SERVER span, not a reconstructed log.
     assert!(spans[0].end_time_unix_nano > spans[0].start_time_unix_nano);
     assert!(spans[0].events.is_empty() && spans[0].links.is_empty());
