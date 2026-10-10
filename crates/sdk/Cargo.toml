@@ -1,11 +1,17 @@
 [package]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.2"
+version = "0.0.1-alpha.3"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
 
+[features]
+default = []
+otlp = ["dep:opentelemetry-otlp", "dep:url"]
+
 [dependencies]
+opentelemetry-otlp = { version = "0.33.1", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+url = { version = "2.5", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 jsonschema = { version = "0.58.6", default-features = false }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
@@ -20,3 +26,7 @@ uuid = { version = "1.27", features = ["v4"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_log-sys = "=0.3.2"
+
+[dev-dependencies]
+prost = "0.14"
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
