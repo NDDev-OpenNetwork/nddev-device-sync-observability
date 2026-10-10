@@ -153,8 +153,17 @@ impl NativeTraces {
         {
             return Err(Error);
         }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|_| Error)?;
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
+            .with_http_client(client)
             .with_protocol(Protocol::HttpBinary)
             .with_endpoint(format!(
                 "{}/v1/traces",
