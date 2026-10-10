@@ -7,28 +7,6 @@ pub enum DebugScope {
     Io,
     Process,
 }
-impl DebugScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::Transport => "transport",
-            Self::Database => "database",
-            Self::Io => "io",
-            Self::Process => "process",
-        }
-    }
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        [
-            Self::Http,
-            Self::Transport,
-            Self::Database,
-            Self::Io,
-            Self::Process,
-        ]
-        .into_iter()
-        .find(|scope| scope.as_str() == value)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DiagnosticsError {
@@ -78,7 +56,7 @@ impl ClientLifecycle {
 
 /// A local sink is never evidence of remote collection or searchable delivery.
 #[derive(Clone)]
-pub struct Diagnostics {
+pub struct LocalDiagnostics {
     pub sink_initialized: bool,
     pub debug_enabled: bool,
     pub debug_scope: Option<DebugScope>,
@@ -88,19 +66,4 @@ pub struct Diagnostics {
     pub write_failures: Option<u64>,
     pub terminating: Option<bool>,
     pub shutdown_incomplete: Option<bool>,
-}
-impl Diagnostics {
-    pub fn unavailable() -> Self {
-        Self {
-            sink_initialized: false,
-            debug_enabled: false,
-            debug_scope: None,
-            rejected_fields_or_events: None,
-            dropped_events: None,
-            pending_events: None,
-            write_failures: None,
-            terminating: None,
-            shutdown_incomplete: None,
-        }
-    }
 }

@@ -110,6 +110,45 @@ impl DebugWindow {
     }
 }
 
+impl view::DebugScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Transport => "transport",
+            Self::Database => "database",
+            Self::Io => "io",
+            Self::Process => "process",
+        }
+    }
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        [
+            Self::Http,
+            Self::Transport,
+            Self::Database,
+            Self::Io,
+            Self::Process,
+        ]
+        .into_iter()
+        .find(|scope| scope.as_str() == value)
+    }
+}
+
+impl view::LocalDiagnostics {
+    pub fn unavailable() -> Self {
+        Self {
+            sink_initialized: false,
+            debug_enabled: false,
+            debug_scope: None,
+            rejected_fields_or_events: None,
+            dropped_events: None,
+            pending_events: None,
+            write_failures: None,
+            terminating: None,
+            shutdown_incomplete: None,
+        }
+    }
+}
+
 struct Policy {
     properties: Map<String, Value>,
     base: Map<String, Value>,
@@ -569,7 +608,7 @@ impl<W: Write> Control<W> {
             "info",
         );
     }
-    pub fn diagnostics(&self) -> view::Diagnostics {
+    pub fn diagnostics(&self) -> view::LocalDiagnostics {
         let health = self.output_health();
         self.tick();
         let debug_scope = self.shared.debug.lock().ok().and_then(|active| {
@@ -577,7 +616,7 @@ impl<W: Write> Control<W> {
                 .as_ref()
                 .and_then(|window| view::DebugScope::parse(&window.window.scope))
         });
-        view::Diagnostics {
+        view::LocalDiagnostics {
             sink_initialized: true,
             debug_enabled: debug_scope.is_some(),
             debug_scope,
