@@ -177,6 +177,7 @@ pub struct Signals {
 impl Signals {
     /// Construct outside Tokio: the OTLP SDK owns bounded blocking-export threads.
     pub fn new(config: &Config) -> Result<Self, Error> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let metrics_delivery = Arc::new(Delivery::default());
         let traces_delivery = Arc::new(Delivery::default());
         let pending = Arc::new(AtomicU64::new(0));

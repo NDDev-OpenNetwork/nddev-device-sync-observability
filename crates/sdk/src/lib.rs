@@ -20,6 +20,9 @@ use tracing::{
     span::{Attributes, Id, Record},
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+#[cfg(feature = "otlp")]
+pub mod otlp;
 use tracing_subscriber::{
     Layer,
     layer::{Context as LayerContext, SubscriberExt},
