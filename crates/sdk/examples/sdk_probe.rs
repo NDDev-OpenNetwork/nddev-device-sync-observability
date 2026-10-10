@@ -19,6 +19,15 @@ fn main() {
         }),
     })
     .expect("owned valid config");
+    if std::env::args().nth(1).as_deref() == Some("--client-cycle") {
+        logger
+            .control
+            .report_failure(nddev_device_sync_telemetry::view::FailureKind::FlutterFramework);
+        logger
+            .control
+            .report_client_lifecycle(nddev_device_sync_telemetry::view::ClientLifecycle::Ready);
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--panic") {
         panic!("SYNTHETIC_PRIVATE_PANIC /private/example token=do-not-emit");
     }
