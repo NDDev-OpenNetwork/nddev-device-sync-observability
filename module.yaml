@@ -1,0 +1,10 @@
+id: observability
+name: nddev-device-sync-observability
+version: 0.0.1-alpha.1
+channel: alpha
+license: AGPL-3.0-only
+repository: NDDev-OpenNetwork/nddev-device-sync-observability
+standards_lock: standarts.lock
+protocol_commit: b80dea717e305d8311e40e7428cc9fe4365401c9
+platforms:
+  - linux

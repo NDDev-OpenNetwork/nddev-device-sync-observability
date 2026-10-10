@@ -1,0 +1,176 @@
+data_dir: /var/lib/vector
+proxy:
+  enabled: false
+secret:
+  runtime:
+    type: directory
+    path: /run/secrets
+    remove_trailing_whitespace: true
+api:
+  enabled: false
+sources:
+  raw:
+    type: fluent
+    address: 0.0.0.0:24224
+  normalized:
+    type: http_server
+    address: 0.0.0.0:8081
+    path: /events
+    strict_path: true
+    auth:
+      strategy: basic
+      username: nds
+      password: SECRET[runtime.vector_password]
+    decoding:
+      codec: json
+    framing:
+      method: newline_delimited
+      newline_delimited:
+        max_length: 16384
+  otlp:
+    type: opentelemetry
+    grpc:
+      address: 0.0.0.0:4317
+      keepalive:
+        max_connection_age_secs: 30
+        max_connection_age_grace_secs: 5
+    http:
+      address: 0.0.0.0:4318
+      keepalive:
+        max_connection_age_secs: 30
+    use_otlp_decoding: true
+transforms:
+  decoded:
+    type: remap
+    inputs: [raw]
+    drop_on_abort: true
+    drop_on_error: true
+    source: |
+      line = string!(.log)
+      assert!(length(line) <= 16384, "event_byte_budget")
+      . = parse_json!(line)
+  envelope:
+    type: remap
+    inputs: [normalized]
+    source: |
+      del(.path)
+      del(.source_type)
+      del(.host)
+sinks:
+  normalizer:
+    type: http
+    inputs: [decoded]
+    uri: http://observability:8080/v2/observability/events
+    method: post
+    auth:
+      strategy: bearer
+      token: SECRET[runtime.ingest_token]
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    payload_prefix: ""
+    payload_suffix: ""
+    request:
+      headers:
+        content-type: application/x-ndjson
+      concurrency: 1
+      timeout_secs: 5
+      retry_attempts: 3
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 3
+    batch:
+      max_events: 100
+      max_bytes: 262144
+      timeout_secs: 0.2
+    buffer:
+      type: memory
+      max_events: 256
+      when_full: block
+    acknowledgements:
+      enabled: true
+  logs:
+    type: http
+    inputs: [envelope]
+    uri: http://openobserve:5080/api/default/nds/_json
+    method: post
+    auth:
+      strategy: basic
+      user: SECRET[runtime.oo_user]
+      password: SECRET[runtime.oo_password]
+    encoding:
+      codec: json
+    framing:
+      method: character_delimited
+      character_delimited:
+        delimiter: ','
+    request:
+      concurrency: 1
+      timeout_secs: 2
+      retry_attempts: 1
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 1
+    batch:
+      max_events: 100
+      max_bytes: 262144
+      timeout_secs: 0.2
+    buffer:
+      type: memory
+      max_events: 256
+      when_full: block
+    acknowledgements:
+      enabled: true
+  traces:
+    type: opentelemetry
+    inputs: [otlp.traces]
+    protocol:
+      type: http
+      uri: http://openobserve:5080/api/default/v1/traces
+      auth:
+        strategy: basic
+        user: SECRET[runtime.oo_user]
+        password: SECRET[runtime.oo_password]
+      encoding:
+        codec: otlp
+      request:
+        concurrency: 1
+        timeout_secs: 2
+        retry_attempts: 1
+        retry_initial_backoff_secs: 1
+        retry_max_duration_secs: 1
+      batch:
+        max_events: 100
+        timeout_secs: 0.2
+    buffer:
+      type: memory
+      max_events: 256
+      when_full: block
+    acknowledgements:
+      enabled: true
+  metrics:
+    type: opentelemetry
+    inputs: [otlp.metrics]
+    protocol:
+      type: http
+      uri: http://openobserve:5080/api/default/v1/metrics
+      auth:
+        strategy: basic
+        user: SECRET[runtime.oo_user]
+        password: SECRET[runtime.oo_password]
+      encoding:
+        codec: otlp
+      request:
+        concurrency: 1
+        timeout_secs: 2
+        retry_attempts: 1
+        retry_initial_backoff_secs: 1
+        retry_max_duration_secs: 1
+      batch:
+        max_events: 100
+        timeout_secs: 0.2
+    buffer:
+      type: memory
+      max_events: 256
+      when_full: block
+    acknowledgements:
+      enabled: true
