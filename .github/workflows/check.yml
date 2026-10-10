@@ -44,10 +44,14 @@ jobs:
         with:
           just-version: '1.58.0'
       - name: Install locked Rust toolchain
-        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy --target aarch64-linux-android,x86_64-linux-android
       - run: just check
       - run: just protocol-check
       - run: just sdk-check
+      - name: Check native Android sink compilation
+        run: |
+          cargo clippy --locked -p nddev-device-sync-telemetry --all-targets --target aarch64-linux-android -- -D warnings
+          cargo clippy --locked -p nddev-device-sync-telemetry --all-targets --target x86_64-linux-android -- -D warnings
       - name: Audit locked dependencies and licenses
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
