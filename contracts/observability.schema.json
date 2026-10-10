@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nddev.ai/schemas/nddev-device-sync/v2/observability.schema.json",
+  "title": "NDS observability control definitions",
+  "$defs": {
+    "Identifier": {
+      "$ref": "https://nddev.ai/schemas/nddev-device-sync/v2/control-plane.schema.json#/$defs/Identifier"
+    },
+    "Timestamp": {
+      "$ref": "https://nddev.ai/schemas/nddev-device-sync/v2/control-plane.schema.json#/$defs/Timestamp"
+    },
+    "IncidentState": {
+      "title": "IncidentState",
+      "type": "string",
+      "enum": [
+        "open",
+        "acknowledged",
+        "resolved"
+      ]
+    },
+    "Incident": {
+      "type": "object",
+      "properties": {
+        "incident_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "dedup_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_.:-]+(?![\\s\\S])"
+        },
+        "service_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.:-]+(?![\\s\\S])"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "admission",
+            "database",
+            "tls",
+            "process",
+            "source_stale",
+            "source_gap",
+            "delivery"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/IncidentState"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "occurrences": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "first_seen": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_seen": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "silenced_until": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "resolved_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "owner": {
+          "type": "string",
+          "const": "operator"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "warning",
+            "critical"
+          ]
+        }
+      },
+      "required": [
+        "incident_id",
+        "dedup_key",
+        "service_name",
+        "kind",
+        "state",
+        "revision",
+        "occurrences",
+        "first_seen",
+        "last_seen",
+        "owner",
+        "severity"
+      ],
+      "additionalProperties": false
+    },
+    "IncidentPage": {
+      "type": "object",
+      "properties": {
+        "incidents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Incident"
+          },
+          "maxItems": 100
+        },
+        "next_cursor": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "generated_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "incidents",
+        "generated_at"
+      ],
+      "additionalProperties": false
+    },
+    "IncidentAction": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![\\s\\S])",
+          "description": "Canonical UUIDv7 created within ten minutes of the request. This bounds replay lifetime below receipt retention."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "operation_id",
+        "expected_revision"
+      ],
+      "additionalProperties": false
+    },
+    "SilenceAction": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![\\s\\S])",
+          "description": "Canonical UUIDv7 created within ten minutes of the request. This bounds replay lifetime below receipt retention."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "until": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "operation_id",
+        "expected_revision",
+        "until"
+      ],
+      "additionalProperties": false
+    },
+    "SourceState": {
+      "title": "SourceState",
+      "type": "string",
+      "enum": [
+        "missing",
+        "fresh",
+        "stale",
+        "unsequenced",
+        "gap_observed",
+        "inactive"
+      ]
+    },
+    "SourceHealth": {
+      "type": "object",
+      "properties": {
+        "service_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.:-]+(?![\\s\\S])"
+        },
+        "state": {
+          "$ref": "#/$defs/SourceState"
+        },
+        "last_received_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "gap_observations": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "last_event_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "service_name",
+        "state",
+        "gap_observations"
+      ],
+      "additionalProperties": false
+    },
+    "ExportMode": {
+      "title": "ExportMode",
+      "type": "string",
+      "enum": [
+        "enabled",
+        "disabled"
+      ]
+    },
+    "IngressReceipt": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "duplicates": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "export_mode": {
+          "$ref": "#/$defs/ExportMode"
+        }
+      },
+      "required": [
+        "accepted",
+        "duplicates",
+        "export_mode"
+      ],
+      "additionalProperties": false
+    },
+    "SignalDelivery": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "healthy",
+            "degraded",
+            "disabled"
+          ]
+        },
+        "successes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "failures": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "last_success_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "state",
+        "successes",
+        "failures"
+      ],
+      "additionalProperties": false
+    },
+    "ObservabilityStatus": {
+      "type": "object",
+      "properties": {
+        "export_mode": {
+          "$ref": "#/$defs/ExportMode"
+        },
+        "queued_events": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "queued_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 67108864
+        },
+        "delivered_events": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "expired_events": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceHealth"
+          },
+          "maxItems": 16
+        },
+        "logs": {
+          "$ref": "#/$defs/SignalDelivery"
+        },
+        "metrics": {
+          "$ref": "#/$defs/SignalDelivery"
+        },
+        "traces": {
+          "$ref": "#/$defs/SignalDelivery"
+        }
+      },
+      "required": [
+        "export_mode",
+        "queued_events",
+        "queued_bytes",
+        "delivered_events",
+        "expired_events",
+        "sources",
+        "logs",
+        "metrics",
+        "traces"
+      ],
+      "additionalProperties": false
+    },
+    "ObservabilityError": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "string",
+          "enum": [
+            "unauthorized",
+            "invalid_request",
+            "capacity_exhausted",
+            "dependency_unavailable",
+            "not_found",
+            "revision_conflict",
+            "idempotency_conflict",
+            "invalid_transition"
+          ]
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

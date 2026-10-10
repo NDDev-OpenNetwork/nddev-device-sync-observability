@@ -1,0 +1,37 @@
+[workspace]
+members = ["crates/sdk"]
+resolver = "3"
+
+[package]
+name = "nddev-device-sync-observability"
+version = "0.0.1-alpha.1"
+edition = "2024"
+rust-version = "1.99"
+license = "AGPL-3.0-only"
+authors = ["NDDev OpenNetwork"]
+
+[dependencies]
+nddev-device-sync-telemetry = { path = "crates/sdk" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+axum = "0.8.9"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+jsonschema = { version = "0.58.6", default-features = false }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "chrono"] }
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1.27", features = ["v4", "v7"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

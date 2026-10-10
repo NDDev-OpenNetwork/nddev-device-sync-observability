@@ -1,0 +1,616 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nddev.ai/schemas/nddev-device-sync/v2/control-plane.schema.json",
+  "title": "NDS control plane v2 definitions",
+  "$comment": "Planned next implementation contract. It does not claim that v2 endpoints currently exist. Validate a named definition, not this definition-only document.",
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:-]+(?![\\s\\S])"
+    },
+    "LongIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_.:-]+(?![\\s\\S])"
+    },
+    "Revision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "OpaqueToken": {
+      "type": "string",
+      "minLength": 43,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])",
+      "x-sensitive": true
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 40
+    },
+    "AuthMethod": {
+      "type": "string",
+      "enum": [
+        "email_otp",
+        "github"
+      ]
+    },
+    "AuthMethods": {
+      "type": "object",
+      "properties": {
+        "email_otp": {
+          "$ref": "#/$defs/MethodAvailability"
+        },
+        "github": {
+          "$ref": "#/$defs/MethodAvailability"
+        }
+      },
+      "required": [
+        "email_otp",
+        "github"
+      ],
+      "additionalProperties": false
+    },
+    "EmailChallengeRequest": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254,
+          "format": "email",
+          "x-sensitive": true
+        }
+      },
+      "required": [
+        "email"
+      ],
+      "additionalProperties": false
+    },
+    "EmailChallenge": {
+      "type": "object",
+      "properties": {
+        "challenge_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "expires_in_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        },
+        "resend_after_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        }
+      },
+      "required": [
+        "challenge_id",
+        "expires_in_seconds",
+        "resend_after_seconds"
+      ],
+      "additionalProperties": false
+    },
+    "EmailVerifyRequest": {
+      "type": "object",
+      "properties": {
+        "challenge_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "code": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 8,
+          "pattern": "^[0-9]{8}(?![\\s\\S])",
+          "x-sensitive": true
+        }
+      },
+      "required": [
+        "challenge_id",
+        "code"
+      ],
+      "additionalProperties": false
+    },
+    "Session": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "auth_method": {
+          "$ref": "#/$defs/AuthMethod"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "user_id",
+        "tenant_id",
+        "auth_method",
+        "expires_at"
+      ],
+      "additionalProperties": false
+    },
+    "SessionIssued": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/Session"
+        },
+        "session_token": {
+          "$ref": "#/$defs/OpaqueToken"
+        }
+      },
+      "required": [
+        "session",
+        "session_token"
+      ],
+      "additionalProperties": false
+    },
+    "GithubStart": {
+      "type": "object",
+      "properties": {
+        "flow_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "authorization_url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "format": "uri"
+        },
+        "exchange_token": {
+          "$ref": "#/$defs/OpaqueToken"
+        },
+        "expires_in_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        },
+        "poll_after_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        },
+        "verification_code": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 8,
+          "pattern": "^[0-9]{8}(?![\\s\\S])",
+          "description": "Comparison code displayed by the initiating app and browser approval page; not a bearer credential or email OTP."
+        }
+      },
+      "required": [
+        "flow_id",
+        "authorization_url",
+        "exchange_token",
+        "expires_in_seconds",
+        "poll_after_seconds",
+        "verification_code"
+      ],
+      "additionalProperties": false
+    },
+    "GithubExchangeRequest": {
+      "type": "object",
+      "properties": {
+        "flow_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "exchange_token": {
+          "$ref": "#/$defs/OpaqueToken"
+        }
+      },
+      "required": [
+        "flow_id",
+        "exchange_token"
+      ],
+      "additionalProperties": false
+    },
+    "GithubPending": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "pending"
+        },
+        "retry_after_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        }
+      },
+      "required": [
+        "status",
+        "retry_after_seconds"
+      ],
+      "additionalProperties": false
+    },
+    "Platform": {
+      "type": "string",
+      "enum": [
+        "macos",
+        "linux",
+        "windows",
+        "ios",
+        "android"
+      ]
+    },
+    "PublicKey": {
+      "type": "string",
+      "minLength": 43,
+      "maxLength": 43,
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048](?![\\s\\S])",
+      "description": "Canonical unpadded base64url encoding of exactly 32 Ed25519 public-key bytes; the adapter also validates decoding and canonical form."
+    },
+    "Signature": {
+      "type": "string",
+      "minLength": 86,
+      "maxLength": 86,
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw](?![\\s\\S])",
+      "description": "Canonical unpadded base64url encoding of exactly 64 Ed25519 signature bytes; the adapter verifies encoding and signature."
+    },
+    "EnrollmentRequest": {
+      "type": "object",
+      "properties": {
+        "platform": {
+          "$ref": "#/$defs/Platform"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "public_key": {
+          "$ref": "#/$defs/PublicKey"
+        }
+      },
+      "required": [
+        "platform",
+        "display_name",
+        "public_key"
+      ],
+      "additionalProperties": false
+    },
+    "EnrollmentChallenge": {
+      "type": "object",
+      "properties": {
+        "challenge_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "device_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "challenge": {
+          "type": "string",
+          "minLength": 43,
+          "maxLength": 43,
+          "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048](?![\\s\\S])"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "challenge_id",
+        "device_id",
+        "challenge",
+        "expires_at"
+      ],
+      "additionalProperties": false
+    },
+    "EnrollmentProof": {
+      "type": "object",
+      "properties": {
+        "challenge_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature"
+        }
+      },
+      "required": [
+        "challenge_id",
+        "signature"
+      ],
+      "additionalProperties": false
+    },
+    "Device": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "platform": {
+          "$ref": "#/$defs/Platform"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "public_key": {
+          "$ref": "#/$defs/PublicKey"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "revoked"
+          ]
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "device_id",
+        "platform",
+        "display_name",
+        "public_key",
+        "status",
+        "created_at"
+      ],
+      "additionalProperties": false
+    },
+    "DeviceList": {
+      "type": "object",
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Device"
+          },
+          "maxItems": 100
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "devices",
+        "next_cursor"
+      ],
+      "additionalProperties": false
+    },
+    "SyncOperation": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "operation_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "device_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "entity_type": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "entity_id": {
+          "$ref": "#/$defs/LongIdentifier"
+        },
+        "base_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/LongIdentifier"
+        },
+        "payload": {
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "description": "Validated against the owning entity schema before append. This envelope does not permit arbitrary entity types or plaintext credentials. The complete UTF-8 request is bounded to 65536 bytes and nesting depth to 32 by the HTTP adapter."
+        }
+      },
+      "required": [
+        "schema_version",
+        "operation_id",
+        "device_id",
+        "entity_type",
+        "entity_id",
+        "base_revision",
+        "idempotency_key",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "SyncApplied": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "const": "applied"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "server_seq": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "outcome",
+        "operation_id",
+        "server_seq",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "SyncConflict": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "const": "conflict"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "server_seq": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "base_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "current_revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "resolution_state": {
+          "type": "string",
+          "const": "unresolved"
+        }
+      },
+      "required": [
+        "outcome",
+        "operation_id",
+        "server_seq",
+        "base_revision",
+        "current_revision",
+        "resolution_state"
+      ],
+      "additionalProperties": false
+    },
+    "SyncResult": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SyncApplied"
+        },
+        {
+          "$ref": "#/$defs/SyncConflict"
+        }
+      ]
+    },
+    "SyncEntry": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/SyncOperation"
+        },
+        "result": {
+          "$ref": "#/$defs/SyncResult"
+        }
+      },
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "SyncPage": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SyncEntry"
+          },
+          "maxItems": 100
+        },
+        "next_after_seq": {
+          "$ref": "#/$defs/Revision"
+        },
+        "has_more": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "entries",
+        "next_after_seq",
+        "has_more"
+      ],
+      "additionalProperties": false
+    },
+    "Error": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "string",
+          "enum": [
+            "invalid_request",
+            "authentication_failed",
+            "authorization_denied",
+            "method_unavailable",
+            "challenge_expired",
+            "rate_limited",
+            "device_revoked",
+            "invalid_signature",
+            "replayed_nonce",
+            "idempotency_conflict",
+            "operation_conflict",
+            "cursor_expired",
+            "revision_exhausted",
+            "dependency_unavailable",
+            "server_busy",
+            "request_timeout"
+          ]
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "MethodAvailability": {
+      "type": "string",
+      "enum": [
+        "available",
+        "unavailable"
+      ],
+      "title": "MethodAvailability"
+    },
+    "GithubApprovalForm": {
+      "type": "object",
+      "properties": {
+        "flow_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "csrf_token": {
+          "$ref": "#/$defs/OpaqueToken"
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "approve",
+            "deny"
+          ]
+        }
+      },
+      "required": [
+        "flow_id",
+        "csrf_token",
+        "decision"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
