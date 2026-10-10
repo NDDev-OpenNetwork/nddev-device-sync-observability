@@ -57,8 +57,8 @@ try:
     assert len(data.encode()) <= 128 * 1024
     lines = [line for line in data.splitlines() if line.startswith('{')]
     records = [json.loads(line) for line in lines]
-    assert len(records) == 43, 'native output missing or fragmented'
-    assert [v['producer.sequence'] for v in records] == list(range(1, 44))
+    assert len(records) == 48, 'native output missing or fragmented'
+    assert [v['producer.sequence'] for v in records] == list(range(1, 49))
     assert len({v['producer.instance_id'] for v in records}) == 1
     assert sum(v['severity'] == 'debug' for v in records) == 8
     assert all(len(line.encode()) <= 3900 for line in lines)
@@ -80,4 +80,4 @@ try:
         run(python, '-c', verify, str(path / 'schema.json'), input='\n'.join(lines) + '\n')
 finally:
     run(*adb, 'shell', 'rm', '-rf', directory)
-print('Android native SDK: actual liblog, 43 complete canonical events with null stdout, bounded debug expiry, adapter oversize/invalid-record loss accounting passed')
+print('Android native SDK: actual liblog, complete canonical lifecycle/failure events with null stdout, bounded debug expiry, adapter oversize/invalid-record loss accounting passed')

@@ -61,13 +61,21 @@ impl Write for LocalWriter {
             add(&self.state.dropped);
             return Err(io::Error::other("telemetry byte budget"));
         }
-        if self.state.terminating.load(Ordering::Acquire) {
+        // Reserve before checking termination. Sequential consistency across
+        // these two atomics ensures shutdown either sees this pending writer,
+        // or this writer observes shutdown and never queues behind the exit.
+        self.state.pending.fetch_add(1, Ordering::SeqCst);
+        if self.state.terminating.load(Ordering::SeqCst) {
+            if self.state.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                // Shutdown may have seen this final reservation while consuming
+                // its wake-up. Notify it again when no payload will follow.
+                let _ = self.sender.try_send(None);
+            }
             add(&self.state.dropped);
             return Err(io::Error::other("telemetry output terminated"));
         }
-        self.state.pending.fetch_add(1, Ordering::Relaxed);
         if self.sender.try_send(Some(bytes.to_vec())).is_err() {
-            self.state.pending.fetch_sub(1, Ordering::Relaxed);
+            self.state.pending.fetch_sub(1, Ordering::SeqCst);
             add(&self.state.dropped);
         }
         Ok(bytes.len())
@@ -102,9 +110,9 @@ impl Worker {
             return;
         }
         self.closed = true;
-        self.writer.state.terminating.store(true, Ordering::Release);
+        self.writer.state.terminating.store(true, Ordering::SeqCst);
         // A full queue already has a wake-up. After draining it the worker sees
-        // terminating and exits; producers cannot enqueue after termination.
+        // terminating and exits after all previously admitted writers finish.
         let _ = self.writer.sender.try_send(None);
         if self.done.recv_timeout(Duration::from_secs(1)).is_err() {
             self.writer.state.incomplete.store(true, Ordering::Relaxed);
@@ -136,10 +144,10 @@ pub(crate) fn start() -> io::Result<(LocalWriter, Worker)> {
                         add(&observed.failures);
                         add(&observed.dropped);
                     }
-                    observed.pending.fetch_sub(1, Ordering::Relaxed);
+                    observed.pending.fetch_sub(1, Ordering::SeqCst);
                 }
-                if observed.terminating.load(Ordering::Acquire)
-                    && observed.pending.load(Ordering::Relaxed) == 0
+                if observed.terminating.load(Ordering::SeqCst)
+                    && observed.pending.load(Ordering::SeqCst) == 0
                 {
                     break;
                 }

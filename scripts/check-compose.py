@@ -74,6 +74,23 @@ def eventually(predicate,seconds=45):
     raise AssertionError('bounded acceptance condition timed out')
 
 def main():
+    command('cargo','build','--locked','-p','nddev-device-sync-telemetry','--example','sdk_probe',cwd=ROOT,timeout=180)
+    source_names=['nddev-device-sync-server','nddev-device-sync-observability','sdk-acceptance']
+    client_events=[]
+    client_log=os.environ.get('NDS_CLIENT_EVENTS_FILE')
+    if client_log:
+        client_log=pathlib.Path(client_log)
+        assert client_log.is_absolute() and client_log.stat().st_size<=32*1024*1024
+        for line in client_log.read_text().splitlines():
+            start=line.find('{')
+            if start<0:continue
+            try:event,_=json.JSONDecoder().raw_decode(line[start:])
+            except json.JSONDecodeError:continue
+            if isinstance(event,dict) and event.get('service.name')=='nddev-device-sync-client':
+                client_events.append(event)
+                assert len(client_events)<=256,'client acceptance event bound'
+        assert any(event.get('event.name')=='client.failure' for event in client_events),'actual client failure required'
+        source_names.append('nddev-device-sync-client')
     # Docker 28.2 introduced the finite Fluent write timeout. Refuse an older
     # engine before building images or creating any ephemeral runtime state.
     version=command('docker','version','--format','{{.Server.Version}}',timeout=10).stdout.strip()
@@ -99,6 +116,7 @@ def main():
             command('docker','build','--tag',SERVER_IMAGE,'--build-arg','NDS_SOURCE_COMMIT='+SERVER_SOURCE,str(server_dir),timeout=300)
         command('docker','build','--tag',OBS_IMAGE,str(ROOT),timeout=300)
         override={'services':{
+            'observability':{'environment':{'NDS_EXPECTED_SOURCES':','.join(source_names)}},
             'probe':{'image':OBS_IMAGE,'entrypoint':['sleep','infinity'],'read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'mem_limit':'32m','pids_limit':16,'networks':['pipeline']},
             'server-postgres':{'image':PG,'user':'postgres','read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'mem_limit':'512m','pids_limit':128,'environment':{'POSTGRES_DB':'nds','POSTGRES_PASSWORD_FILE':'/run/secrets/postgres_admin_password'},'secrets':['postgres_admin_password','postgres_migrator_password','postgres_runtime_password'],'volumes':[f'{server_dir}/deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro'],'tmpfs':['/var/lib/postgresql:uid=999,gid=999,mode=0700,size=256m','/var/run/postgresql:uid=999,gid=999,mode=3775,size=16m','/tmp:uid=999,gid=999,mode=1777,size=16m'],'networks':['pipeline'],'healthcheck':{'test':['CMD-SHELL','pg_isready -U postgres -d nds -h 127.0.0.1'],'interval':'1s','timeout':'2s','retries':30}},
             'server-migrate':{'image':SERVER_IMAGE,'command':['migrate'],'mem_limit':'256m','read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'environment':{'NDS_MIGRATION_DATABASE_URL_FILE':'/run/secrets/server_migration_url'},'secrets':['server_migration_url'],'networks':['pipeline'],'depends_on':{'server-postgres':{'condition':'service_healthy'}}},
@@ -134,7 +152,7 @@ def main():
             def search(table,kind,where):
                 assert table.replace('_','').isalnum()
                 now=time.time_ns()//1000
-                payload={'query':{'sql':f'SELECT * FROM "{table}" WHERE {where}','start_time':now-120_000_000,'end_time':now+2_000_000,'from':0,'size':100}}
+                payload={'query':{'sql':f'SELECT * FROM "{table}" WHERE {where}','start_time':now-86_400_000_000,'end_time':now+2_000_000,'from':0,'size':100}}
                 code,body=request(oo+'/api/default/_search?type='+kind,payload,headers=oo_headers)
                 if code!=200:return []
                 return json.loads(body).get('hits',[])
@@ -153,6 +171,36 @@ def main():
             print('Actual server trace-correlated log searchable; native processing OTLP span and operational metrics searchable')
             def incidents():
                 code,body=request(obs+'/v2/observability/incidents',token=values['admin_token']);assert code==200;return json.loads(body)['incidents']
+            # The records come from the actual shared Rust producer, not hand-
+            # assembled successful payloads. Ingress -> Vector -> OpenObserve
+            # and the durable incident machine consume exactly those records.
+            produced=command(ROOT/'target/debug/examples/sdk_probe','--client-cycle',timeout=5)
+            assert len(produced.stdout.encode())<=128*1024
+            cycle=[json.loads(line) for line in produced.stdout.splitlines()]
+            ready_index=next(i for i,event in enumerate(cycle) if event['event.name']=='client.ready')
+            def ingest(events):
+                data=''.join(json.dumps(event,separators=(',',':'))+'\n' for event in events)
+                code,reply=request(obs+'/v2/observability/events',data,token=values['ingest_token'],headers={'Content-Type':'application/x-ndjson'})
+                assert code==200
+                return json.loads(reply)
+            first=cycle[:ready_index]
+            assert ingest(first)['accepted']==len(first)
+            failure=next(event for event in first if event['event.name']=='client.failure')
+            actual=eventually(lambda:next((row for row in incidents() if row['service_name']=='sdk-acceptance' and row['kind']=='process' and row['state']=='open'),None))
+            assert actual['occurrences']==1
+            assert ingest(first)['duplicates']==len(first)
+            assert ingest(cycle[ready_index:])['accepted']==len(cycle)-ready_index
+            eventually(lambda:any(row['incident_id']==actual['incident_id'] and row['state']=='resolved' for row in incidents()))
+            observed=eventually(lambda:search('nds','logs',"trace_id='"+failure['trace_id']+"'"))
+            assert any(row.get('error_type',row.get('error.type'))=='flutter_framework_error' for row in observed)
+            print('Actual shared SDK client failure searchable: one incident, duplicate replay retained, readiness resolved it')
+            if client_events:
+                for start in range(0,len(client_events),100):ingest(client_events[start:start+100])
+                for kind in ['flutter_framework_error','dart_unhandled_error']:
+                    event=next(event for event in client_events if event.get('error.type')==kind)
+                    observed=eventually(lambda:search('nds','logs',"trace_id='"+event['trace_id']+"'"))
+                    assert any(row.get('error_type',row.get('error.type'))==kind for row in observed)
+                print('Actual Flutter framework and root-isolate async failures searchable through canonical ingress, Vector and OpenObserve')
             lock=subprocess.Popen(['docker','exec',service_id('server-postgres'),'psql','-XAt','-U','postgres','-d','nds','-c',"BEGIN; LOCK TABLE nddev_schema_meta IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(8); COMMIT;"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             eventually(lambda:sql('server-postgres',"SELECT count(*) FROM pg_locks WHERE relation='nddev_schema_meta'::regclass AND mode='AccessExclusiveLock' AND granted")=='1')
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -203,7 +251,7 @@ def main():
                 return any(row['service_name']=='nddev-device-sync-server' and row['state']=='fresh' for row in status()['sources'])
             eventually(recovered_source,seconds=30)
             print('Collector interruption: independent source staleness detected and recovered; no exact loss count inferred from gaps')
-            override['services']['observability']={'environment':{'NDS_TELEMETRY_ENABLED':'false','NDS_VECTOR_PASSWORD_FILE':'/not-configured'}}
+            override['services']['observability']['environment'].update(NDS_TELEMETRY_ENABLED='false',NDS_VECTOR_PASSWORD_FILE='/not-configured')
             override_path.write_text(json.dumps(override))
             compose('up','--detach','--no-deps','--force-recreate','observability',timeout=30)
             eventually(lambda:request(obs+'/v1/ready')[0]==200)
@@ -221,7 +269,7 @@ def main():
             assert after_disabled['queued_events']<=disabled['queued_events']
             assert after_disabled['delivered_events']==disabled['delivered_events']
             print('Full export opt-out: no new logs/spans exported, exporter credential unnecessary, local security/lifecycle signals retained')
-            del override['services']['observability']
+            override['services']['observability']={'environment':{'NDS_EXPECTED_SOURCES':','.join(source_names)}}
             override_path.write_text(json.dumps(override))
             compose('up','--detach','--no-deps','--force-recreate','observability',timeout=30)
             eventually(lambda:request(obs+'/v1/ready')[0]==200)
@@ -234,7 +282,7 @@ def main():
                     if used.endswith(unit):total+=float(used[:-len(unit)])*factor;break
             assert total<6144
             print(f'Sampled Docker memory working set including separate server test DB: {total:.1f} MiB; configured runtime caps below 8 GiB')
-            retained=','.join(['nddev-device-sync-server']+[f'acceptance-source-{i}' for i in range(14)])
+            retained=','.join(['nddev-device-sync-server']+[f'acceptance-source-{i}' for i in range(16-len(source_names))])
             registration_name=project+'-registration'
             compose('run','--detach','--rm','--no-deps','--name',registration_name,'--env','NDS_EXPECTED_SOURCES='+retained,'--env','NDS_TELEMETRY_ENABLED=false','observability')
             try:
@@ -242,7 +290,7 @@ def main():
             finally:command('docker','stop','--time','15',registration_name,check=False,timeout=20)
             compose('restart','observability',timeout=30)
             eventually(lambda:request(obs+'/v1/ready')[0]==200)
-            sources=status()['sources'];assert len(sources)==16 and sum(row['state']=='inactive' for row in sources)==14
+            sources=status()['sources'];assert len(sources)==16 and sum(row['state']=='inactive' for row in sources)==16-len(source_names)
             rejected=compose('run','--rm','--no-deps','--env','NDS_EXPECTED_SOURCES=unregistered-source','--env','NDS_TELEMETRY_ENABLED=false','observability',check=False,timeout=20)
             assert rejected.returncode!=0
             assert sql('postgres','SELECT count(*) FROM sources')=='16'

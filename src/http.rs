@@ -2,7 +2,7 @@ use crate::{
     application::{ActionCommand, Error, Repository},
     config::Config,
     domain::{self, Action},
-    normalize::Normalizer,
+    normalize,
     signals::Signals,
     store::PgRepository,
     wire,
@@ -28,7 +28,6 @@ pub struct App {
     pub config: Arc<Config>,
     pub repository: PgRepository,
     pub signals: Arc<Signals>,
-    normalizer: Normalizer,
     requests: Semaphore,
 }
 impl App {
@@ -43,7 +42,6 @@ impl App {
             config,
             repository,
             signals,
-            normalizer: Normalizer::new()?,
             requests: Semaphore::new(8),
         }))
     }
@@ -134,7 +132,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/v2/observability/incidents/{id}/silence", post(silence))
         .route("/v2/observability/incidents/{id}/resolve", post(resolve))
-        .layer(DefaultBodyLimit::max(1_638_500))
+        .layer(DefaultBodyLimit::max(
+            100 * (nddev_device_sync_telemetry::MAX_EVENT_BYTES + 1),
+        ))
         .with_state(app.clone())
         .layer(middleware::from_fn_with_state(app, boundary))
 }
@@ -155,7 +155,7 @@ async fn ingest(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) ->
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
-        if line.len() > 16_384 || events.len() >= 100 {
+        if line.len() > nddev_device_sync_telemetry::MAX_EVENT_BYTES || events.len() >= 100 {
             app.signals.rejected("invalid");
             return reject(Error::Invalid);
         }
@@ -166,7 +166,7 @@ async fn ingest(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) ->
                 return reject(Error::Invalid);
             }
         };
-        match app.normalizer.accept(value, Utc::now()) {
+        match normalize::accept(value, Utc::now()) {
             Ok((event, accepted)) => {
                 spans.push(app.signals.processing(&event));
                 events.push(accepted);
