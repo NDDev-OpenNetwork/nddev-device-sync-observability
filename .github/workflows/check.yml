@@ -1,0 +1,60 @@
+name: NDS observability checks
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14.4'
+      - name: Read immutable acceptance server source
+        id: fixture
+        run: |
+          python - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import re,tomllib
+          value=tomllib.load(open('acceptance-server.lock','rb'))
+          assert value['source_repo']=='NDDev-OpenNetwork/nddev-device-sync-server'
+          assert re.fullmatch('[a-f0-9]{40}',value['source_commit'])
+          print('commit='+value['source_commit'])
+          PYTHON
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: NDDev-OpenNetwork/nddev-device-sync-server
+          ref: ${{ steps.fixture.outputs.commit }}
+          path: .server-acceptance-source
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v6
+        with:
+          node-version: '24.21.0'
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+        with:
+          just-version: '1.58.0'
+      - name: Install locked Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+      - run: just check
+      - run: just protocol-check
+      - run: just sdk-check
+      - name: Audit locked dependencies and licenses
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo audit
+          cargo deny check licenses sources
+      - name: Verify real pipeline and durable incident lifecycle
+        env:
+          NDS_SERVER_SOURCE_DIR: ${{ github.workspace }}/.server-acceptance-source
+        run: just integration

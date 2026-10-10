@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Isolated real pipeline acceptance. All accounts, credentials and events are owned
+runtime input. No provider accounts, machine inventory or evidence enter the tree.
+"""
+import base64
+import datetime
+import concurrent.futures
+import io
+import json
+import os
+import pathlib
+import secrets
+import socket
+import subprocess
+import tarfile
+import tempfile
+import time
+import tomllib
+import re
+import urllib.error
+import urllib.request
+import uuid
+
+ROOT=pathlib.Path(__file__).resolve().parents[1]
+SERVER_LOCK=tomllib.loads((ROOT/'acceptance-server.lock').read_text())
+assert SERVER_LOCK['source_repo']=='NDDev-OpenNetwork/nddev-device-sync-server'
+SERVER_SOURCE=SERVER_LOCK['source_commit']
+assert re.fullmatch('[a-f0-9]{40}',SERVER_SOURCE)
+SERVER_IMAGE='nds-server-acceptance:'+SERVER_SOURCE[:12]
+OBS_IMAGE='nds-observability-acceptance:local'
+DEBIAN='debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587'
+PG='postgres:18.6-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c'
+
+class CommandFailure(AssertionError):
+    def __init__(self,summary,diagnostics):
+        super().__init__(summary);self.diagnostics=diagnostics
+
+def command(*args,check=True,**kw):
+    result=subprocess.run(args,capture_output=True,text=True,**kw)
+    if check and result.returncode:
+        # Build/config diagnostics contain only public source. Runtime logs are
+        # never emitted here; inspect only safe failure classes in owned tests.
+        raise CommandFailure('command failed: '+str(args[0])+' '+str(args[1])+' exit '+str(result.returncode),result.stderr[-8000:])
+    return result
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1',0));return sock.getsockname()[1]
+
+PROBE=None
+
+def request(url,data=None,token=None,headers=None,method=None):
+    headers=dict(headers or {})
+    if token:headers['Authorization']='Bearer '+token
+    if isinstance(data,dict):data=json.dumps(data);headers['Content-Type']='application/json'
+    if isinstance(data,bytes):data=data.decode()
+    lines=['url = '+json.dumps(url), 'noproxy = "*"','max-time = 12','silent','show-error','write-out = "\\n%{http_code}"']
+    if method:lines.append('request = '+json.dumps(method))
+    for name,value in headers.items():lines.append('header = '+json.dumps(name+': '+value))
+    if data is not None:lines.append('data-binary = '+json.dumps(data))
+    result=command('docker','exec','-i',PROBE,'curl','--config','-',input='\n'.join(lines)+'\n',check=False,timeout=15)
+    if result.returncode:raise ConnectionError('internal test transport unavailable')
+    body,code=result.stdout.rsplit('\n',1)
+    return int(code),body.encode()
+
+def eventually(predicate,seconds=45):
+    deadline=time.monotonic()+seconds
+    while time.monotonic()<deadline:
+        try:
+            result=predicate()
+            if result:return result
+        except (urllib.error.URLError,ConnectionError,TimeoutError):pass
+        time.sleep(.2)
+    raise AssertionError('bounded acceptance condition timed out')
+
+def main():
+    project='nds-obs-test-'+secrets.token_hex(5)
+    with tempfile.TemporaryDirectory(prefix='nds-obs-acceptance-') as temp:
+        directory=pathlib.Path(temp);private=directory/'secrets';private.mkdir(mode=0o700)
+        values={key:secrets.token_urlsafe(32) for key in ['postgres_admin_password','postgres_migrator_password','postgres_runtime_password','ingest_token','admin_token','vector_password','oo_password']}
+        values['oo_password']+='Aa1!'
+        values['oo_user']=secrets.token_hex(12)+'@example.invalid'
+        for key,role in [('migration_url','nds_migrator'),('runtime_url','nds_runtime')]:
+            password=values['postgres_migrator_password' if key=='migration_url' else 'postgres_runtime_password']
+            values[key]=f'postgres://{role}:{password}@postgres:5432/nds_observability'
+            values['server_'+key]=f'postgres://{role}:{password}@server-postgres:5432/nds'
+        for key,value in values.items():
+            path=private/key;path.write_text(value+'\n');path.chmod(0o444)
+        env=os.environ.copy();env.update(NDS_TEST_SECRETS=str(private),NDS_FLUENT_PORT=str(free_port()),NDS_OBS_IMAGE=OBS_IMAGE,NDS_OO_USER=values['oo_user'],NDS_OO_PASSWORD=values['oo_password'],NDS_SOURCE_STALE_SECONDS='5')
+        server_dir=directory/'server';server_dir.mkdir()
+        archive=subprocess.check_output(['git','-C',os.environ.get('NDS_SERVER_SOURCE_DIR',str(ROOT.parent/'nddev-device-sync-server')),'archive',SERVER_SOURCE])
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tree:tree.extractall(server_dir,filter='data')
+        if command('docker','image','inspect',SERVER_IMAGE,check=False).returncode:
+            command('docker','build','--tag',SERVER_IMAGE,'--build-arg','NDS_SOURCE_COMMIT='+SERVER_SOURCE,str(server_dir),timeout=300)
+        command('docker','build','--tag',OBS_IMAGE,str(ROOT),timeout=300)
+        override={'services':{
+            'probe':{'image':OBS_IMAGE,'entrypoint':['sleep','infinity'],'read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'mem_limit':'32m','pids_limit':16,'networks':['pipeline']},
+            'server-postgres':{'image':PG,'user':'postgres','read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'mem_limit':'512m','pids_limit':128,'environment':{'POSTGRES_DB':'nds','POSTGRES_PASSWORD_FILE':'/run/secrets/postgres_admin_password'},'secrets':['postgres_admin_password','postgres_migrator_password','postgres_runtime_password'],'volumes':[f'{server_dir}/deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro'],'tmpfs':['/var/lib/postgresql:uid=999,gid=999,mode=0700,size=256m','/var/run/postgresql:uid=999,gid=999,mode=3775,size=16m','/tmp:uid=999,gid=999,mode=1777,size=16m'],'networks':['pipeline'],'healthcheck':{'test':['CMD-SHELL','pg_isready -U postgres -d nds -h 127.0.0.1'],'interval':'1s','timeout':'2s','retries':30}},
+            'server-migrate':{'image':SERVER_IMAGE,'command':['migrate'],'mem_limit':'256m','read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'environment':{'NDS_MIGRATION_DATABASE_URL_FILE':'/run/secrets/server_migration_url'},'secrets':['server_migration_url'],'networks':['pipeline'],'depends_on':{'server-postgres':{'condition':'service_healthy'}}},
+            'server':{'image':SERVER_IMAGE,'command':['serve'],'read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'mem_limit':'512m','pids_limit':64,'environment':{'DATABASE_URL_FILE':'/run/secrets/server_runtime_url','NDS_SERVER_ADDR':'0.0.0.0:8080','NDS_MAX_REQUESTS':'1','NDS_MAX_CONNECTIONS':'4'},'secrets':['server_runtime_url'],'networks':['pipeline'],'depends_on':{'server-migrate':{'condition':'service_completed_successfully'}},'logging':{'driver':'fluentd','options':{'fluentd-address':'127.0.0.1:'+env['NDS_FLUENT_PORT'],'fluentd-async':'true','fluentd-buffer-limit':'256','fluentd-max-retries':'3','fluentd-retry-wait':'1s','fluentd-write-timeout':'2s','fluentd-async-reconnect-interval':'1s','mode':'non-blocking','max-buffer-size':'1m','cache-max-size':'2m','cache-max-file':'2'}}},
+        },'secrets':{'server_migration_url':{'file':str(private/'server_migration_url')},'server_runtime_url':{'file':str(private/'server_runtime_url')}}}
+        override_path=directory/'override.json';override_path.write_text(json.dumps(override))
+        prefix=['docker','compose','--project-name',project,'--file',str(ROOT/'deploy/compose.yaml'),'--file',str(override_path)]
+        def compose(*args,**kw):return command(*prefix,*args,env=env,**kw)
+        def service_id(service):return compose('ps','--quiet',service).stdout.strip()
+        def sql(service,text):return command('docker','exec',service_id(service),'psql','-XAt','-v','ON_ERROR_STOP=1','-U','postgres','-d','nds' if service=='server-postgres' else 'nds_observability','-c',text).stdout.strip()
+        def endpoint(service,port):return f'http://{service}:{port}'
+        try:
+            # Only this uniquely named, test-owned volume requires initial UID setup.
+            command('docker','volume','create',project+'_oo_data')
+            command('docker','run','--rm','--network','none','--user','0','--cap-drop','ALL','--cap-add','CHOWN','--security-opt','no-new-privileges:true','--mount',f'type=volume,src={project}_oo_data,dst=/data',DEBIAN,'chown','10001:10001','/data')
+            compose('up','--detach','openobserve','vector','postgres','server-postgres','probe')
+            global PROBE
+            PROBE=service_id('probe')
+            oo=endpoint('openobserve',5080)
+            eventually(lambda:request(oo+'/healthz')[0]==200)
+            oo_headers={'Authorization':'Basic '+base64.b64encode((values['oo_user']+':'+values['oo_password']).encode()).decode()}
+            code,_=request(oo+'/api/default/streams',headers=oo_headers)
+            assert code==200,f'OpenObserve basic API status {code}'
+            compose('up','--detach','observability','server',timeout=120)
+            obs=endpoint('observability',8080);server=endpoint('server',8080)
+            eventually(lambda:request(obs+'/v1/ready')[0]==200)
+            eventually(lambda:request(server+'/v1/ready')[0]==200)
+            def status():
+                code,body=request(obs+'/v2/observability/status',token=values['admin_token']);assert code==200;return json.loads(body)
+            eventually(lambda:status()['delivered_events']>0)
+            trace=uuid.uuid4().hex
+            assert request(server+'/v1/health',headers={'traceparent':'00-'+trace+'-'+secrets.token_hex(8)+'-01'})[0]==200
+            def search(table,kind,where):
+                assert table.replace('_','').isalnum()
+                now=time.time_ns()//1000
+                payload={'query':{'sql':f'SELECT * FROM "{table}" WHERE {where}','start_time':now-120_000_000,'end_time':now+2_000_000,'from':0,'size':100}}
+                code,body=request(oo+'/api/default/_search?type='+kind,payload,headers=oo_headers)
+                if code!=200:return []
+                return json.loads(body).get('hits',[])
+            logs=eventually(lambda:search('nds','logs',"trace_id='"+trace+"'"))
+            assert any(row.get('source_commit',row.get('source.commit'))==SERVER_SOURCE for row in logs)
+            def streams(kind):
+                code,body=request(oo+'/api/default/streams?type='+kind,headers=oo_headers)
+                assert code==200
+                return [row['name'] for row in json.loads(body)['list']]
+            trace_streams=eventually(lambda:streams('traces'))
+            spans=eventually(lambda:next((found for table in trace_streams if (found:=search(table,'traces',"trace_id='"+trace+"'"))),None))
+            assert spans
+            metric_streams=eventually(lambda:streams('metrics'))
+            assert any(name.startswith('nds_observability_events_accepted') for name in metric_streams)
+            eventually(lambda:status()['metrics']['successes']>0 and status()['traces']['successes']>0)
+            print('Actual server trace-correlated log searchable; native processing OTLP span and operational metrics searchable')
+            def incidents():
+                code,body=request(obs+'/v2/observability/incidents',token=values['admin_token']);assert code==200;return json.loads(body)['incidents']
+            lock=subprocess.Popen(['docker','exec',service_id('server-postgres'),'psql','-XAt','-U','postgres','-d','nds','-c',"BEGIN; LOCK TABLE nddev_schema_meta IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(8); COMMIT;"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            eventually(lambda:sql('server-postgres',"SELECT count(*) FROM pg_locks WHERE relation='nddev_schema_meta'::regclass AND mode='AccessExclusiveLock' AND granted")=='1')
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                held=pool.submit(request,server+'/v1/ready')
+                eventually(lambda:sql('server-postgres',"SELECT count(*) FROM pg_stat_activity WHERE usename='nds_runtime' AND wait_event_type='Lock'")=='1')
+                for _ in range(3):assert request(server+'/v1/health')[0]==503
+                incident=eventually(lambda:next((row for row in incidents() if row['kind']=='admission' and row['state']=='open' and row['occurrences']>=2),None),seconds=5)
+                assert incident['owner']=='operator' and incident['severity']=='warning'
+                path=obs+'/v2/observability/incidents/'+incident['incident_id']
+                body={'operation_id':str(uuid.uuid7()),'expected_revision':incident['revision']}
+                headers={'X-NDS-Actor':'operator'}
+                assert request(path+'/acknowledge',body,headers=headers)[0]==401
+                assert request(path+'/acknowledge',body,token=values['ingest_token'],headers=headers)[0]==401
+                code,reply=request(path+'/acknowledge',body,token=values['admin_token'],headers=headers);assert code==200
+                acknowledged=json.loads(reply);assert acknowledged['state']=='acknowledged'
+                assert request(path+'/acknowledge',body,token=values['admin_token'],headers=headers)==(200,reply)
+                conflicting=body|{'expected_revision':acknowledged['revision']}
+                assert request(path+'/acknowledge',conflicting,token=values['admin_token'],headers=headers)[0]==409
+                until=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat()
+                code,silenced=request(path+'/silence',{'operation_id':str(uuid.uuid7()),'expected_revision':acknowledged['revision'],'until':until},token=values['admin_token'],headers=headers);assert code==200
+                assert 'silenced_until' in json.loads(silenced)
+                lock.wait(timeout=12);held.result(timeout=12)
+            assert request(server+'/v1/ready')[0]==200
+            resolved=eventually(lambda:next((row for row in incidents() if row['incident_id']==incident['incident_id'] and row['state']=='resolved'),None))
+            assert 'silenced_until' not in resolved
+            compose('restart','observability',timeout=30)
+            eventually(lambda:request(obs+'/v1/ready')[0]==200)
+            assert request(path+'/acknowledge',body,token=values['admin_token'],headers=headers)==(200,reply)
+            print('Actual PostgreSQL pressure: incident dedup, denied callers, acknowledgement, silence, recovery and persisted idempotent replay passed')
+            compose('stop','--timeout','10','openobserve',timeout=20)
+            assert request(server+'/v1/health')[0]==200
+            eventually(lambda:status()['queued_events']>0 and status()['logs']['state']=='degraded')
+            assert status()['queued_events']<=4096 and status()['queued_bytes']<=67108864
+            compose('start','openobserve')
+            eventually(lambda:request(oo+'/healthz')[0]==200)
+            eventually(lambda:status()['queued_events']==0 and status()['logs']['state']=='healthy',seconds=60)
+            print('Real OpenObserve outage/restart: bounded durable log outbox resumed delivery')
+            # Collector failure happens before durable ingress: zero outbox
+            # alone must not report that the source stream is fresh.
+            assert request(server+'/v1/health')[0]==200
+            eventually(lambda:status()['queued_events']==0)
+            compose('stop','--timeout','10','vector',timeout=20)
+            assert request(server+'/v1/health')[0]==200
+            eventually(lambda:any(row['service_name']=='nddev-device-sync-server' and row['state']=='stale' for row in status()['sources']),seconds=15)
+            compose('start','vector')
+            def recovered_source():
+                request(server+'/v1/health')
+                return any(row['service_name']=='nddev-device-sync-server' and row['state']=='fresh' for row in status()['sources'])
+            eventually(recovered_source,seconds=30)
+            print('Collector interruption: independent source staleness detected and recovered; no exact loss count inferred from gaps')
+            override['services']['observability']={'environment':{'NDS_TELEMETRY_ENABLED':'false','NDS_VECTOR_PASSWORD_FILE':'/not-configured'}}
+            override_path.write_text(json.dumps(override))
+            compose('up','--detach','--no-deps','--force-recreate','observability',timeout=30)
+            eventually(lambda:request(obs+'/v1/ready')[0]==200)
+            disabled=status();assert disabled['export_mode']=='disabled'
+            assert all(disabled[k]['state']=='disabled' for k in ['logs','metrics','traces'])
+            disabled_trace=uuid.uuid4().hex
+            assert request(server+'/v1/health',headers={'traceparent':'00-'+disabled_trace+'-'+secrets.token_hex(8)+'-01'})[0]==200
+            assert request(obs+'/v2/observability/incidents')[0]==401
+            time.sleep(4)
+            assert not search('nds','logs',"trace_id='"+disabled_trace+"'")
+            assert not any(search(table,'traces',"trace_id='"+disabled_trace+"'") for table in trace_streams)
+            local=compose('logs','--tail','30','observability').stdout
+            assert 'ingress.rejected' in local and 'server.started' in local
+            after_disabled=status()
+            assert after_disabled['queued_events']<=disabled['queued_events']
+            assert after_disabled['delivered_events']==disabled['delivered_events']
+            print('Full export opt-out: no new logs/spans exported, exporter credential unnecessary, local security/lifecycle signals retained')
+            del override['services']['observability']
+            override_path.write_text(json.dumps(override))
+            compose('up','--detach','--no-deps','--force-recreate','observability',timeout=30)
+            eventually(lambda:request(obs+'/v1/ready')[0]==200)
+            ids=[service_id(name) for name in ['postgres','observability','vector','openobserve','server','server-postgres']]
+            samples=command('docker','stats','--no-stream','--format','{{json .}}',*ids).stdout
+            total=0.0
+            for line in samples.splitlines():
+                used=json.loads(line)['MemUsage'].split('/')[0].strip()
+                for unit,factor in [('GiB',1024),('MiB',1),('KiB',1/1024),('B',1/1048576)]:
+                    if used.endswith(unit):total+=float(used[:-len(unit)])*factor;break
+            assert total<6144
+            print(f'Sampled Docker memory working set including separate server test DB: {total:.1f} MiB; configured runtime caps below 8 GiB')
+            retained=','.join(['nddev-device-sync-server']+[f'acceptance-source-{i}' for i in range(14)])
+            registration_name=project+'-registration'
+            compose('run','--detach','--rm','--no-deps','--name',registration_name,'--env','NDS_EXPECTED_SOURCES='+retained,'--env','NDS_TELEMETRY_ENABLED=false','observability')
+            try:
+                eventually(lambda:sql('postgres','SELECT count(*) FROM sources')=='16')
+            finally:command('docker','stop','--time','15',registration_name,check=False,timeout=20)
+            compose('restart','observability',timeout=30)
+            eventually(lambda:request(obs+'/v1/ready')[0]==200)
+            sources=status()['sources'];assert len(sources)==16 and sum(row['state']=='inactive' for row in sources)==14
+            rejected=compose('run','--rm','--no-deps','--env','NDS_EXPECTED_SOURCES=unregistered-source','--env','NDS_TELEMETRY_ENABLED=false','observability',check=False,timeout=20)
+            assert rejected.returncode!=0
+            assert sql('postgres','SELECT count(*) FROM sources')=='16'
+            print('Real PostgreSQL source registration: canonical set capped at16, retained inactive rows visible after restart,17th source refused transactionally')
+            sql('postgres',"UPDATE delivery_state SET time_floor=clock_timestamp()+interval '2 hours'")
+            eventually(lambda:sql('postgres','SELECT count(*) FROM incident_actions')=='0')
+            compose('restart','observability',timeout=30)
+            eventually(lambda:request(obs+'/v1/ready')[0]==200)
+            assert request(path+'/acknowledge',body,token=values['admin_token'],headers=headers)[0]==400
+            print('Persisted time floor: expired receipt pruned, service restarted, old UUIDv7 refused after observed-time rollback')
+        except Exception as error:
+            diagnostics=getattr(error,"diagnostics","")+"\n"+compose("logs","--tail","100","openobserve","vector","migrate","observability",check=False).stdout
+            for private_value in sorted(values.values(),key=len,reverse=True):diagnostics=diagnostics.replace(private_value,"[generated-private-value]")
+            print("\n".join(line for line in diagnostics.splitlines() if any(word in line for word in [" ERROR "," WARN ","panicked", "Error response from daemon"]))[:9000])
+            raise
+        finally:
+            # Scope is the random Compose project created above, never other work.
+            compose('down','--volumes','--remove-orphans','--timeout','20',check=False,timeout=60)
+            command('docker','volume','rm',project+'_oo_data',check=False)
+
+if __name__=='__main__':main()

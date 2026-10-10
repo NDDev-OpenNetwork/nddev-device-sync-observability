@@ -1,0 +1,146 @@
+# Internal pipeline. The acceptance script supplies only ephemeral generated values.
+# Persistent deployment requires separately approved, quota-bound data volumes.
+services:
+  postgres:
+    image: postgres:18.6-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
+    user: postgres
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 1
+    pids_limit: 128
+    environment:
+      POSTGRES_DB: nds_observability
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+    command: [postgres, -c, max_connections=20, -c, shared_buffers=64MB, -c, max_wal_size=128MB, -c, min_wal_size=32MB]
+    secrets: [postgres_admin_password,postgres_migrator_password,postgres_runtime_password]
+    volumes:
+      - pg_data:/var/lib/postgresql
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+    tmpfs:
+      - /var/run/postgresql:uid=999,gid=999,mode=3775,size=16m
+      - /tmp:uid=999,gid=999,mode=1777,size=16m
+    networks: [pipeline]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres -d nds_observability -h 127.0.0.1']
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  migrate:
+    image: ${NDS_OBS_IMAGE:?required}
+    command: [migrate]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 32
+    environment:
+      NDS_OBS_MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_url
+    secrets: [migration_url]
+    networks: [pipeline]
+    depends_on:
+      postgres: {condition: service_healthy}
+  observability:
+    stop_grace_period: 40s
+    image: ${NDS_OBS_IMAGE:?required}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 64
+    environment:
+      NDS_OBS_DATABASE_URL_FILE: /run/secrets/runtime_url
+      NDS_INGEST_TOKEN_FILE: /run/secrets/ingest_token
+      NDS_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      NDS_VECTOR_PASSWORD_FILE: /run/secrets/vector_password
+      NDS_SOURCE_STALE_SECONDS: ${NDS_SOURCE_STALE_SECONDS:-90}
+      NDS_SIGNAL_INTERVAL_SECONDS: '2'
+      NDS_DELIVERY_INTERVAL_MS: '250'
+      NDS_EXPECTED_SOURCES: nddev-device-sync-server,nddev-device-sync-observability
+    secrets: [runtime_url,ingest_token,admin_token,vector_password]
+    networks: [pipeline]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:${NDS_FLUENT_PORT:?required}
+        fluentd-async: 'true'
+        fluentd-buffer-limit: '256'
+        fluentd-max-retries: '3'
+        fluentd-retry-wait: '1s'
+        fluentd-write-timeout: '2s'
+        fluentd-async-reconnect-interval: '1s'
+        mode: non-blocking
+        max-buffer-size: 1m
+        cache-max-size: 2m
+        cache-max-file: '2'
+  vector:
+    image: timberio/vector:0.59.0-debian@sha256:98e7b4dfe50750e61470697bbd2fbeca643d12bea97f351005038ef506eab630
+    user: '10001:10001'
+    command: [--config,/etc/vector/vector.yaml,--threads,"2",--chunk-size-events,"64",--max-decompressed-size-bytes,"1638500",--graceful-shutdown-limit-secs,"10"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 64
+    secrets: [ingest_token,vector_password,oo_user,oo_password]
+    volumes:
+      - ./vector.yaml:/etc/vector/vector.yaml:ro
+    tmpfs:
+      - /var/lib/vector:uid=10001,gid=10001,mode=0700,size=16m
+    ports: ['127.0.0.1:${NDS_FLUENT_PORT:?required}:24224']
+    networks: [pipeline,collector]
+  openobserve:
+    image: public.ecr.aws/zinclabs/openobserve:v1.0.4@sha256:d4a878fac1f6c56003764f7f2a1625668917388f167e222c8c810de3f54c56ba
+    user: '10001:10001'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 3g
+    cpus: 2
+    pids_limit: 256
+    environment:
+      ZO_ROOT_USER_EMAIL: ${NDS_OO_USER:?required}
+      ZO_ROOT_USER_PASSWORD: ${NDS_OO_PASSWORD:?required}
+      ZO_LOCAL_MODE: 'true'
+      ZO_LOCAL_MODE_STORAGE: disk
+      ZO_DATA_DIR: /data
+      ZO_TELEMETRY: 'false'
+      ZO_MODEL_PRICING_ENABLED: 'false'
+      ZO_MMDB_DISABLE_DOWNLOAD: 'true'
+      ZO_COMPACT_DATA_RETENTION_DAYS: '3'
+      ZO_MEMORY_CACHE_MAX_SIZE: '128'
+      ZO_DISK_CACHE_ENABLED: 'false'
+      ZO_WAL_FSYNC_DISABLED: 'false'
+      ZO_HTTP_WORKER_NUM: '2'
+      ZO_HTTP_WORKER_MAX_BLOCKING: '4'
+      ZO_GRPC_RUNTIME_WORKER_NUM: '2'
+      ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM: '4'
+      ZO_JOB_RUNTIME_WORKER_NUM: '2'
+      ZO_JOB_RUNTIME_BLOCKING_WORKER_NUM: '4'
+      ZO_WAL_WRITE_QUEUE_SIZE: '256'
+    volumes: [oo_data:/data]
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=1777,size=64m
+    networks: [pipeline]
+networks:
+  pipeline: {internal: true}
+  collector: {}
+volumes:
+  pg_data: {}
+  oo_data: {}
+secrets:
+  postgres_admin_password: {file: '${NDS_TEST_SECRETS:?required}/postgres_admin_password'}
+  postgres_migrator_password: {file: '${NDS_TEST_SECRETS:?required}/postgres_migrator_password'}
+  postgres_runtime_password: {file: '${NDS_TEST_SECRETS:?required}/postgres_runtime_password'}
+  migration_url: {file: '${NDS_TEST_SECRETS:?required}/migration_url'}
+  runtime_url: {file: '${NDS_TEST_SECRETS:?required}/runtime_url'}
+  ingest_token: {file: '${NDS_TEST_SECRETS:?required}/ingest_token'}
+  admin_token: {file: '${NDS_TEST_SECRETS:?required}/admin_token'}
+  vector_password: {file: '${NDS_TEST_SECRETS:?required}/vector_password'}
+  oo_user: {file: '${NDS_TEST_SECRETS:?required}/oo_user'}
+  oo_password: {file: '${NDS_TEST_SECRETS:?required}/oo_password'}

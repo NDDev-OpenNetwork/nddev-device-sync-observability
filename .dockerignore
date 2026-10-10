@@ -1,0 +1,6 @@
+.git
+target
+.env
+secrets
+data
+.server-acceptance-source/
