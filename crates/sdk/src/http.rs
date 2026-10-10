@@ -1,4 +1,4 @@
-use crate::{CONTRACT, Error};
+use crate::{Error, contract::DOCUMENT as CONTRACT};
 use opentelemetry::trace::Status;
 use serde_json::Value;
 use std::sync::LazyLock;

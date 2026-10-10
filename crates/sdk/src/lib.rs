@@ -9,7 +9,7 @@ use std::{
     fmt,
     io::Write,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -30,12 +30,12 @@ mod output;
 pub use output::{LocalWriter, OutputHealth};
 mod http;
 pub use http::{finish_http_server_span, http_server_span};
+mod contract;
+pub mod event;
+pub mod view;
+pub use contract::{MAX_EVENT_BYTES, decode_event};
 
-pub const MAX_EVENT_BYTES: usize = 16_384;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
-const SCHEMA: &str = include_str!("../telemetry-event.schema.json");
-static CONTRACT: LazyLock<Value> =
-    LazyLock::new(|| serde_json::from_str(SCHEMA).expect("embedded telemetry schema"));
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid telemetry configuration or unavailable subscriber")]
@@ -61,9 +61,95 @@ pub struct DebugWindow {
     pub duration: Duration,
     pub events: u64,
 }
+impl DebugWindow {
+    fn validate(&self) -> Result<(), Error> {
+        if valid_scope(&self.scope)
+            && (1..=900).contains(&self.duration.as_secs())
+            && self.duration.subsec_nanos() == 0
+            && (1..=10000).contains(&self.events)
+        {
+            Ok(())
+        } else {
+            Err(Error)
+        }
+    }
+
+    /// One server/service configuration contract; adapters supply environment I/O.
+    pub fn from_settings(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, Error> {
+        match get("NDS_LOG_MODE").as_deref().unwrap_or("normal") {
+            "normal"
+                if [
+                    "NDS_DEBUG_SCOPE",
+                    "NDS_DEBUG_SECONDS",
+                    "NDS_DEBUG_EVENT_LIMIT",
+                ]
+                .iter()
+                .all(|name| get(name).is_none()) =>
+            {
+                Ok(None)
+            }
+            "debug" => {
+                let value = Self {
+                    scope: get("NDS_DEBUG_SCOPE").ok_or(Error)?,
+                    duration: Duration::from_secs(
+                        get("NDS_DEBUG_SECONDS")
+                            .ok_or(Error)?
+                            .parse()
+                            .map_err(|_| Error)?,
+                    ),
+                    events: get("NDS_DEBUG_EVENT_LIMIT")
+                        .unwrap_or_else(|| "1000".into())
+                        .parse()
+                        .map_err(|_| Error)?,
+                };
+                value.validate()?;
+                Ok(Some(value))
+            }
+            _ => Err(Error),
+        }
+    }
+}
+
+impl view::DebugScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Transport => "transport",
+            Self::Database => "database",
+            Self::Io => "io",
+            Self::Process => "process",
+        }
+    }
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        [
+            Self::Http,
+            Self::Transport,
+            Self::Database,
+            Self::Io,
+            Self::Process,
+        ]
+        .into_iter()
+        .find(|scope| scope.as_str() == value)
+    }
+}
+
+impl view::LocalDiagnostics {
+    pub fn unavailable() -> Self {
+        Self {
+            sink_initialized: false,
+            debug_enabled: false,
+            debug_scope: None,
+            rejected_fields_or_events: None,
+            dropped_events: None,
+            pending_events: None,
+            write_failures: None,
+            terminating: None,
+            shutdown_incomplete: None,
+        }
+    }
+}
 
 struct Policy {
-    schema: jsonschema::Validator,
     properties: Map<String, Value>,
     base: Map<String, Value>,
 }
@@ -75,19 +161,10 @@ impl Policy {
         {
             return Err(Error);
         }
-        if let Some(debug) = &config.debug
-            && (!valid_scope(&debug.scope)
-                || !(1..=900).contains(&debug.duration.as_secs())
-                || debug.duration.subsec_nanos() != 0
-                || !(1..=10000).contains(&debug.events))
-        {
-            return Err(Error);
+        if let Some(debug) = &config.debug {
+            debug.validate()?;
         }
-        let source = &*CONTRACT;
-        let schema = jsonschema::options()
-            .should_validate_formats(true)
-            .build(source)
-            .map_err(|_| Error)?;
+        let source = &*contract::DOCUMENT;
         let base: Map<_, _> = [
             ("service.name", &config.service),
             ("service.version", &config.version),
@@ -106,11 +183,10 @@ impl Policy {
         check.insert("timestamp".into(), chrono::Utc::now().to_rfc3339().into());
         check.insert("severity".into(), "info".into());
         check.insert("event.name".into(), "logging.initialized".into());
-        if !schema.is_valid(&Value::Object(check)) {
+        if !contract::VALIDATOR.is_valid(&Value::Object(check)) {
             return Err(Error);
         }
         Ok(Self {
-            schema,
             properties: source["properties"].as_object().ok_or(Error)?.clone(),
             base,
         })
@@ -138,7 +214,7 @@ impl Policy {
     }
 }
 fn valid_scope(scope: &str) -> bool {
-    matches!(scope, "http" | "transport" | "database" | "io" | "process")
+    view::DebugScope::parse(scope).is_some()
 }
 fn identifier(value: &str) -> bool {
     !value.is_empty()
@@ -180,8 +256,8 @@ impl Visitor<'_> {
             self.fields.rejected += 1;
             return;
         }
-        let text = if field.name() == "error.type" && !identifier(text) {
-            "redacted_error"
+        let text = if field.name() == "error.type" {
+            contract::error_class(text)
         } else {
             text
         };
@@ -255,7 +331,7 @@ struct Shared<W> {
     config: Config,
 }
 impl<W: Write> Shared<W> {
-    fn emit(&self, mut fields: Map<String, Value>, severity: &str) {
+    fn prepare(&self, mut fields: Map<String, Value>, severity: &str) -> Map<String, Value> {
         for (key, value) in &self.policy.base {
             if key != "module" || !fields.contains_key(key) {
                 fields.insert(key.clone(), value.clone());
@@ -268,7 +344,7 @@ impl<W: Write> Shared<W> {
                 .into(),
         );
         fields.insert("severity".into(), severity.into());
-        if !self.policy.schema.is_valid(&Value::Object(fields.clone())) {
+        if !contract::VALIDATOR.is_valid(&Value::Object(fields.clone())) {
             self.rejected.fetch_add(1, Ordering::Relaxed);
             fields.retain(|k, _| {
                 self.policy.base.contains_key(k) || matches!(k.as_str(), "timestamp" | "severity")
@@ -279,10 +355,17 @@ impl<W: Write> Shared<W> {
             fields.insert("outcome".into(), "rejected".into());
             fields.insert("rejected_count".into(), 1.into());
         }
+        fields
+    }
+    fn emit(&self, fields: Map<String, Value>, severity: &str) {
+        let fields = self.prepare(fields, severity);
         let Ok(mut sink) = self.sink.lock() else {
             self.write_failures.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        self.write(&mut sink, fields);
+    }
+    fn write(&self, sink: &mut Sink<W>, mut fields: Map<String, Value>) {
         if sink.sequence < MAX_COUNTER {
             sink.sequence += 1;
             fields.insert("producer.instance_id".into(), sink.instance.clone().into());
@@ -299,6 +382,24 @@ impl<W: Write> Shared<W> {
         if sink.writer.write_all(&bytes).is_err() {
             self.write_failures.fetch_add(1, Ordering::Relaxed);
         }
+    }
+    fn panic_notice(&self) {
+        // Never format PanicHookInfo, invoke a prior raw hook, or wait for a
+        // logger mutex while unwinding (including a panic inside formatting).
+        let Ok(mut sink) = self.sink.try_lock() else {
+            self.write_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let fields = self.prepare(
+            Map::from_iter([
+                ("event.name".into(), "process.failed".into()),
+                ("error.type".into(), "rust_panic".into()),
+                ("module".into(), "process".into()),
+                ("outcome".into(), "error".into()),
+            ]),
+            "fatal",
+        );
+        self.write(&mut sink, fields);
     }
     fn reject_fields(&self, count: u64) {
         if count > 0 {
@@ -488,6 +589,68 @@ impl<W: Write> Clone for Control<W> {
     }
 }
 impl<W: Write> Control<W> {
+    pub fn report_client_lifecycle(&self, state: view::ClientLifecycle) {
+        self.shared.emit(
+            Map::from_iter([
+                ("event.name".into(), state.event().into()),
+                ("module".into(), "ui".into()),
+                ("scope".into(), "process".into()),
+                (
+                    "outcome".into(),
+                    if state == view::ClientLifecycle::Ready {
+                        "ready"
+                    } else {
+                        "checked"
+                    }
+                    .into(),
+                ),
+            ]),
+            "info",
+        );
+    }
+    pub fn diagnostics(&self) -> view::LocalDiagnostics {
+        let health = self.output_health();
+        self.tick();
+        let debug_scope = self.shared.debug.lock().ok().and_then(|active| {
+            active
+                .as_ref()
+                .and_then(|window| view::DebugScope::parse(&window.window.scope))
+        });
+        view::LocalDiagnostics {
+            sink_initialized: true,
+            debug_enabled: debug_scope.is_some(),
+            debug_scope,
+            rejected_fields_or_events: Some(self.rejected_fields_or_events()),
+            dropped_events: Some(health.dropped_events),
+            pending_events: Some(health.pending_events),
+            write_failures: Some(health.write_failures),
+            terminating: Some(health.terminating),
+            shutdown_incomplete: Some(health.shutdown_incomplete),
+        }
+    }
+
+    /// Native presentation supplies a closed class, never an exception or stack.
+    /// This records an actual reporting operation; it does not reconstruct a
+    /// missing application span or promise collection/delivery.
+    pub fn report_failure(&self, kind: view::FailureKind) {
+        let span = operation_span("ui", "process").expect("static reporting scope");
+        let context = trace_context(&span);
+        let context_span = context.span();
+        let ids = context_span.span_context();
+        let mut fields = Map::from_iter([
+            ("event.name".into(), "client.failure".into()),
+            ("module".into(), "ui".into()),
+            ("scope".into(), "process".into()),
+            ("error.type".into(), kind.class().into()),
+            ("outcome".into(), "error".into()),
+        ]);
+        if ids.is_valid() {
+            fields.insert("trace_id".into(), ids.trace_id().to_string().into());
+            fields.insert("span_id".into(), ids.span_id().to_string().into());
+        }
+        span.set_status(opentelemetry::trace::Status::error(kind.class()));
+        self.shared.emit(fields, "error");
+    }
     pub fn rejected_fields_or_events(&self) -> u64 {
         self.shared.rejected.load(Ordering::Relaxed)
     }
@@ -519,13 +682,8 @@ impl<W: Write> Control<W> {
         if self.output_health().terminating {
             return Err(Error);
         }
-        if let Some(debug) = &window
-            && (!valid_scope(&debug.scope)
-                || !(1..=900).contains(&debug.duration.as_secs())
-                || debug.duration.subsec_nanos() != 0
-                || !(1..=10000).contains(&debug.events))
-        {
-            return Err(Error);
+        if let Some(debug) = &window {
+            debug.validate()?;
         }
         let mut active = self.shared.debug.lock().map_err(|_| Error)?;
         if let Some(previous) = active.take() {
@@ -604,12 +762,29 @@ pub struct Logger {
 }
 impl Drop for Logger {
     fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+impl Logger {
+    /// Terminal and idempotent. Platforms call this only on an actual controlled
+    /// exit, never on mobile background/detach notifications.
+    pub fn shutdown(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
         if let Some((cancel, thread)) = self.expiry.take() {
             let _ = cancel.send(());
             let _ = thread.join();
         }
         self.control.shared.disable_debug("process_exit");
-        if let Some(provider) = &self.provider {
+        self.control.shared.emit(
+            Map::from_iter([
+                ("event.name".into(), "process.stopped".into()),
+                ("outcome".into(), "stopped".into()),
+            ]),
+            "info",
+        );
+        if let Some(provider) = self.provider.take() {
             let _ = provider.shutdown_with_timeout(Duration::from_secs(2));
         }
         if let Some(mut worker) = self.worker.take() {
@@ -633,6 +808,15 @@ pub fn install_with_tracer(config: Config, tracer: Tracer) -> Result<Logger, Err
     let (subscriber, mut control) = subscriber(config, writer, tracer)?;
     control.output = Some(output.clone());
     tracing::subscriber::set_global_default(subscriber).map_err(|_| Error)?;
+    let panic_control = control.clone();
+    std::panic::set_hook(Box::new(move |_| panic_control.shared.panic_notice()));
+    control.shared.emit(
+        Map::from_iter([
+            ("event.name".into(), "process.started".into()),
+            ("outcome".into(), "started".into()),
+        ]),
+        "info",
+    );
     let shared = control.shared.clone();
     let (cancel, receiver) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
@@ -744,7 +928,7 @@ mod tests {
         }
     }
     fn records(bytes: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
-        let schema: Value = serde_json::from_str(SCHEMA).unwrap();
+        let schema = contract::DOCUMENT.clone();
         let validator = jsonschema::options()
             .should_validate_formats(true)
             .build(&schema)
@@ -763,6 +947,91 @@ mod tests {
             assert!(validator.is_valid(value), "schema rejected emitted event");
         }
         result
+    }
+
+    #[test]
+    fn producers_and_ingress_share_validation_and_redaction() {
+        let provider = SdkTracerProvider::builder().build();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (subscriber, control) = subscriber(
+            config(),
+            Capture(bytes.clone()),
+            provider.tracer("contract"),
+        )
+        .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(event.name="operation.failed",error.type="private:class",outcome="error");
+            control.report_failure(view::FailureKind::FlutterFramework);
+        });
+        let emitted = records(&bytes);
+        assert_eq!(emitted[0]["error.type"], "redacted_error");
+        for value in &emitted {
+            let decoded = decode_event(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), *value);
+        }
+        let mut external = emitted[0].clone();
+        external["error.type"] = "private:class".into();
+        assert_eq!(
+            decode_event(external.clone())
+                .unwrap()
+                .error_type
+                .as_deref(),
+            Some("redacted_error")
+        );
+        external["authorization"] = "synthetic-secret".into();
+        assert!(decode_event(external).is_err());
+        let mut oversized = emitted[0].clone();
+        oversized["event.name"] = "x".repeat(MAX_EVENT_BYTES + 1).into();
+        assert!(decode_event(oversized).is_err());
+        let mut invalid_time = emitted[0].clone();
+        invalid_time["timestamp"] = "not-a-date".into();
+        assert!(decode_event(invalid_time).is_err());
+    }
+
+    #[test]
+    fn debug_settings_have_one_explicit_bounded_contract() {
+        assert!(DebugWindow::from_settings(|_| None).unwrap().is_none());
+        assert!(
+            DebugWindow::from_settings(|name| (name == "NDS_DEBUG_SCOPE").then(|| "io".into()))
+                .is_err()
+        );
+        for (name, value) in [
+            ("NDS_DEBUG_SCOPE", "all"),
+            ("NDS_DEBUG_SECONDS", "0"),
+            ("NDS_DEBUG_SECONDS", "901"),
+            ("NDS_DEBUG_EVENT_LIMIT", "10001"),
+            ("NDS_LOG_MODE", "verbose"),
+        ] {
+            assert!(
+                DebugWindow::from_settings(|key| {
+                    Some(
+                        if key == name {
+                            value
+                        } else {
+                            match key {
+                                "NDS_LOG_MODE" => "debug",
+                                "NDS_DEBUG_SCOPE" => "io",
+                                "NDS_DEBUG_SECONDS" => "30",
+                                "NDS_DEBUG_EVENT_LIMIT" => "10",
+                                _ => return None,
+                            }
+                        }
+                        .into(),
+                    )
+                })
+                .is_err()
+            );
+        }
+        let valid = DebugWindow::from_settings(|key| match key {
+            "NDS_LOG_MODE" => Some("debug".into()),
+            "NDS_DEBUG_SCOPE" => Some("io".into()),
+            "NDS_DEBUG_SECONDS" => Some("30".into()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(valid.events, 1000);
+        assert_eq!(valid.duration, Duration::from_secs(30));
     }
     #[test]
     fn unknown_debug_is_not_formatted_and_schema_violations_are_observable() {

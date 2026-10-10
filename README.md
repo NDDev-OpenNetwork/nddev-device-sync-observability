@@ -31,7 +31,19 @@ hour; timestamped operation IDs and a persisted monotonic observed-time floor
 prevent an expired operation from becoming new again after clock rollback.
 
 The shared `crates/sdk` package owns schema projection, redaction, real operation
-span context and bounded debug windows. `install` uses one writer with 128 event
+span context and bounded debug windows. The collector consumes the same generated
+event DTO and validator; it adds ingress freshness/admission rules. The SDK also
+owns typed Flutter failure/lifecycle inputs and local diagnostic status. No
+exception text or stack crosses that boundary. Process installation replaces the
+raw Rust panic hook with a fixed redacted fatal event; a contended logger records
+failure rather than waiting while unwinding. Startup and controlled shutdown are
+emitted once by the SDK. Forced process termination cannot promise a final event.
+
+Servers and the collector use the same `NDS_LOG_MODE=normal|debug`,
+`NDS_DEBUG_SCOPE=http|transport|database|io|process`, `NDS_DEBUG_SECONDS=1..900`
+and optional `NDS_DEBUG_EVENT_LIMIT=1..10000` (default 1000). Normal mode rejects
+stray debug settings; expiry returns to normal through the same audited window.
+`install` uses one writer with 128 event
 slots, nonblocking admission, loss counters and at most one second of writer
 shutdown waiting. A stuck OS writer is detached until process exit; neither
 flushing nor delivery is promised for an undrained pipe. `subscriber<W>` is a

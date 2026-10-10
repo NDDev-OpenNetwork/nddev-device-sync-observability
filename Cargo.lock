@@ -1267,14 +1267,13 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-observability"
-version = "0.0.1-alpha.1"
+version = "0.0.1-alpha.2"
 dependencies = [
  "axum",
  "chrono",
  "http-body-util",
  "hyper",
  "hyper-util",
- "jsonschema",
  "nddev-device-sync-telemetry",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1295,13 +1294,14 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.1"
+version = "0.0.1-alpha.2"
 dependencies = [
  "android_log-sys",
  "chrono",
  "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
+ "serde",
  "serde_json",
  "thiserror",
  "tracing",

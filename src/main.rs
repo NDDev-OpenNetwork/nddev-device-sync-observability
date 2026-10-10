@@ -1,8 +1,10 @@
 use nddev_device_sync_observability::{config, runtime, signals::Signals, store};
-use nddev_device_sync_telemetry::{Config, install};
+use nddev_device_sync_telemetry::{Config, DebugWindow, install};
 use std::sync::Arc;
 
 fn main() -> std::process::ExitCode {
+    let debug = DebugWindow::from_settings(|name| std::env::var(name).ok());
+    let logging_valid = debug.is_ok();
     let logging = install(Config {
         service: "nddev-device-sync-observability".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -13,12 +15,16 @@ fn main() -> std::process::ExitCode {
         environment: "self-hosted".into(),
         target_prefixes: vec!["nddev_device_sync_observability".into()],
         default_module: "process".into(),
-        debug: None,
+        debug: debug.unwrap_or(None),
     });
     let Ok(_logging) = logging else {
         eprintln!("telemetry initialization failed");
         return std::process::ExitCode::FAILURE;
     };
+    if !logging_valid {
+        tracing::error!(event.name="process.failed",error.type="invalid_logging_configuration",outcome="error");
+        return std::process::ExitCode::FAILURE;
+    }
     let result = execute();
     if result.is_err() {
         tracing::error!(event.name="process.failed",error.type="process_unavailable",outcome="error");
