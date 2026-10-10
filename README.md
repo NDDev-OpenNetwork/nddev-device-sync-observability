@@ -36,6 +36,15 @@ slots, nonblocking admission, loss counters and at most one second of writer
 shutdown waiting. A stuck OS writer is detached until process exit; neither
 flushing nor delivery is promised for an undrained pipe. `subscriber<W>` is a
 caller-owned embedded/test API with the supplied writer's lifecycle contract.
+Android uses native liblog (Logcat tag `NDS`) through the same queue and policy,
+because application stdout can be `/dev/null`. Complete JSON records are capped
+at 3,900 bytes; larger records or native rejections count as write failures and
+loss, with no truncation. Admitted debug records use the native INFO transport
+priority while retaining JSON severity; process-global log filters stay intact.
+Native acceptance does not promise durable storage or later retrieval.
+For the real Android sink check, select an owned running device explicitly:
+`python3 scripts/check-android-sdk.py --serial SERIAL --ndk ANDROID_NDK_PATH`.
+It checks the native SDK process; production Flutter APK acceptance is separate.
 
 Run `just check`, `just protocol-check`, `just sdk-check` and `just integration`.
 Integration requires Docker Engine >=28.2.0 for finite Fluent write timeouts;

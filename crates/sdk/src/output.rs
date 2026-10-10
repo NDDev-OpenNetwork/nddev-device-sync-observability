@@ -1,9 +1,10 @@
-//! One process-owned bounded stdout worker. A blocked OS write is not cancellable;
+//! One process-owned bounded local output worker. A blocked OS write is not cancellable;
 //! shutdown waits at most one second, then detaches this single worker until the
 //! process exits. No flush/delivery is promised for a full or broken pipe.
 use crate::MAX_EVENT_BYTES;
+#[cfg(not(target_os = "android"))]
+use std::fs::File;
 use std::{
-    fs::File,
     io::{self, Write},
     sync::{
         Arc,
@@ -12,6 +13,8 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(target_os = "android")]
+mod android;
 const CAPACITY: usize = 128;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 fn add(counter: &AtomicU64) {
@@ -75,6 +78,7 @@ impl Write for LocalWriter {
 }
 /// Separate OS handle avoids holding Rust's global stdout lock, which its process
 /// exit cleanup also acquires. This is essential with an undrained stdout pipe.
+#[cfg(not(target_os = "android"))]
 fn stdout_file() -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -113,7 +117,10 @@ impl Drop for Worker {
     }
 }
 pub(crate) fn start() -> io::Result<(LocalWriter, Worker)> {
+    #[cfg(not(target_os = "android"))]
     let mut output = stdout_file()?;
+    #[cfg(target_os = "android")]
+    let mut output = android::Logcat;
     let (sender, receiver) = mpsc::sync_channel::<Option<Vec<u8>>>(CAPACITY);
     let (done, completion) = mpsc::sync_channel(1);
     let state = Arc::new(State::default());
