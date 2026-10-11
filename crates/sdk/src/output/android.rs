@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn actual_native_sink_counts_oversize_and_invalid_records_without_truncation() {
-        let (mut writer, mut worker) = crate::output::start().unwrap();
+        let (mut writer, mut worker) = crate::output::start(crate::LocalOutput::Stdout).unwrap();
         writer
             .write_all(b"{\"severity\":\"info\",\"event.name\":\"sdk.native.accepted\"}\n")
             .unwrap();
