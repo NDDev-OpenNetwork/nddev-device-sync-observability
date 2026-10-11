@@ -857,6 +857,10 @@ pub fn install_with_tracer_to(
 ) -> Result<Logger, Error> {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.set(()).map_err(|_| Error)?;
+    // Privacy does not depend on a working OS sink. If initialization fails,
+    // retain a nonblocking hook that cannot print a raw panic payload/stack.
+    // The structured hook replaces it once the bounded sink is available.
+    std::panic::set_hook(Box::new(|_| {}));
     let (writer, worker) = output::start(output).map_err(|_| Error)?;
     let output = writer.state.clone();
     let (subscriber, mut control) = subscriber(config, writer, tracer)?;

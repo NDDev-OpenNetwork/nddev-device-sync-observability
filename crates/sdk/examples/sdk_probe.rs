@@ -18,6 +18,15 @@ fn main() {
             events: 100,
         }),
     };
+    #[cfg(all(unix, not(target_os = "android")))]
+    if std::env::args().nth(1).as_deref() == Some("--closed-stdout-panic") {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        unsafe {
+            drop(OwnedFd::from_raw_fd(1));
+        }
+        assert!(install(config).is_err());
+        panic!("SYNTHETIC_PRIVATE_UNINITIALIZED_PANIC");
+    }
     use opentelemetry::trace::TracerProvider as _;
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
     let stderr = std::env::args().nth(1).as_deref() == Some("--stderr");
