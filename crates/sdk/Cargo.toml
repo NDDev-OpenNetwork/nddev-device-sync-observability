@@ -1,15 +1,18 @@
 [package]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.5"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
 
 [features]
 default = []
+client-traces = ["dep:prost", "dep:opentelemetry-proto"]
 otlp = ["dep:opentelemetry-otlp", "dep:url", "dep:reqwest", "dep:rustls"]
 
 [dependencies]
+prost = { version = "0.14", optional = true }
+opentelemetry-proto = { version = "0.33.1", optional = true, default-features = false, features = ["gen-tonic-messages", "trace"] }
 opentelemetry-otlp = { version = "0.33.1", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }

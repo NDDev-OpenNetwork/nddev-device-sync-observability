@@ -28,6 +28,7 @@ pub struct AcceptedEvent {
     pub route: Option<String>,
     pub status: Option<i32>,
     pub timestamp_ms: i64,
+    pub device: Option<String>,
     pub instance: Option<String>,
     pub sequence: Option<i64>,
 }

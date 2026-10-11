@@ -29,8 +29,14 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
+#[cfg(feature = "client-traces")]
+pub mod client_traces;
+mod feed;
+#[cfg(any(feature = "otlp", feature = "client-traces"))]
+mod span;
+pub use feed::{ExportBatch, ExportFeed, FeedHealth};
 mod output;
-pub use output::{LocalWriter, OutputHealth};
+pub use output::{LocalOutput, LocalWriter, OutputHealth};
 mod http;
 pub use http::{finish_http_server_span, http_server_span};
 mod contract;
@@ -229,6 +235,7 @@ fn identifier(value: &str) -> bool {
 
 #[derive(Default, Clone)]
 struct Fields {
+    export_suppressed: bool,
     values: Map<String, Value>,
     rejected: u64,
 }
@@ -326,6 +333,7 @@ struct ActiveDebug {
     remaining: u64,
 }
 struct Shared<W> {
+    feed: feed::Router,
     policy: Policy,
     sink: Mutex<Sink<W>>,
     rejected: AtomicU64,
@@ -361,14 +369,17 @@ impl<W: Write> Shared<W> {
         fields
     }
     fn emit(&self, fields: Map<String, Value>, severity: &str) {
+        self.emit_export(fields, severity, true);
+    }
+    fn emit_export(&self, fields: Map<String, Value>, severity: &str, export: bool) {
         let fields = self.prepare(fields, severity);
         let Ok(mut sink) = self.sink.lock() else {
             self.write_failures.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        self.write(&mut sink, fields);
+        self.write(&mut sink, fields, export);
     }
-    fn write(&self, sink: &mut Sink<W>, mut fields: Map<String, Value>) {
+    fn write(&self, sink: &mut Sink<W>, mut fields: Map<String, Value>, export: bool) {
         if sink.sequence < MAX_COUNTER {
             sink.sequence += 1;
             fields.insert("producer.instance_id".into(), sink.instance.clone().into());
@@ -382,6 +393,16 @@ impl<W: Write> Shared<W> {
             return;
         }
         bytes.push(b'\n');
+        // Delivery operations keep local diagnostics but never feed themselves.
+        if export
+            && !fields
+                .get("route")
+                .and_then(Value::as_str)
+                .is_some_and(|route| route.starts_with("/v2/observability/"))
+            && fields.get("module").and_then(Value::as_str) != Some("telemetry")
+        {
+            self.feed.enqueue(&fields);
+        }
         if sink.writer.write_all(&bytes).is_err() {
             self.write_failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -402,7 +423,7 @@ impl<W: Write> Shared<W> {
             ]),
             "fatal",
         );
-        self.write(&mut sink, fields);
+        self.write(&mut sink, fields, true);
     }
     fn reject_fields(&self, count: u64) {
         if count > 0 {
@@ -491,7 +512,23 @@ where
     }
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: LayerContext<'_, S>) {
         if let Some(span) = ctx.span(id) {
-            let mut fields = Fields::default();
+            let parent = attrs.parent().and_then(|id| ctx.span(id)).or_else(|| {
+                attrs
+                    .is_contextual()
+                    .then(|| ctx.lookup_current())
+                    .flatten()
+            });
+            let mut fields = Fields {
+                export_suppressed: attrs.metadata().target() == "nds_telemetry"
+                    && attrs.metadata().name() == "telemetry.delivery"
+                    || parent.is_some_and(|parent| {
+                        parent
+                            .extensions()
+                            .get::<Fields>()
+                            .is_some_and(|fields| fields.export_suppressed)
+                    }),
+                ..Fields::default()
+            };
             attrs.record(&mut Visitor {
                 fields: &mut fields,
                 policy: &self.shared.policy,
@@ -528,6 +565,7 @@ where
         if let Some(scope) = ctx.event_scope(event) {
             for span in scope.from_root() {
                 if let Some(value) = span.extensions().get::<Fields>() {
+                    fields.export_suppressed |= value.export_suppressed;
                     fields.values.extend(value.values.clone());
                     fields.rejected += value.rejected;
                 }
@@ -570,9 +608,10 @@ where
             }
         }
         self.shared.reject_fields(fields.rejected);
-        self.shared.emit(
+        self.shared.emit_export(
             fields.values,
             &metadata.level().as_str().to_ascii_lowercase(),
+            !fields.export_suppressed,
         );
         self.shared.debug_tick();
     }
@@ -592,6 +631,9 @@ impl<W: Write> Clone for Control<W> {
     }
 }
 impl<W: Write> Control<W> {
+    pub fn subscribe(&self) -> Result<ExportFeed, Error> {
+        self.shared.feed.subscribe()
+    }
     pub fn report_client_lifecycle(&self, state: view::ClientLifecycle) {
         self.shared.emit(
             Map::from_iter([
@@ -712,6 +754,7 @@ pub fn subscriber<W: Write + Send + Sync + 'static>(
 ) -> Result<(impl Subscriber + Send + Sync, Control<W>), Error> {
     let policy = Policy::new(&config)?;
     let shared = Arc::new(Shared {
+        feed: feed::Router::default(),
         policy,
         sink: Mutex::new(Sink {
             writer,
@@ -804,9 +847,21 @@ pub fn install(config: Config) -> Result<Logger, Error> {
     Ok(logger)
 }
 pub fn install_with_tracer(config: Config, tracer: Tracer) -> Result<Logger, Error> {
+    install_with_tracer_to(config, tracer, LocalOutput::Stdout)
+}
+/// Same bounded native sink and lifecycle, with an explicit CLI output stream.
+pub fn install_with_tracer_to(
+    config: Config,
+    tracer: Tracer,
+    output: LocalOutput,
+) -> Result<Logger, Error> {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.set(()).map_err(|_| Error)?;
-    let (writer, worker) = output::start().map_err(|_| Error)?;
+    // Privacy does not depend on a working OS sink. If initialization fails,
+    // retain a nonblocking hook that cannot print a raw panic payload/stack.
+    // The structured hook replaces it once the bounded sink is available.
+    std::panic::set_hook(Box::new(|_| {}));
+    let (writer, worker) = output::start(output).map_err(|_| Error)?;
     let output = writer.state.clone();
     let (subscriber, mut control) = subscriber(config, writer, tracer)?;
     control.output = Some(output.clone());
@@ -873,7 +928,34 @@ pub fn operation_span(module: &str, scope: &str) -> Result<tracing::Span, Error>
     if !identifier(module) || !valid_scope(scope) {
         return Err(Error);
     }
-    Ok(tracing::info_span!(target:"nds_telemetry","module.operation",module,scope))
+    let suppressed = current_export_suppressed();
+    let span = tracing::info_span!(target:"nds_telemetry","module.operation",module,scope);
+    if suppressed {
+        span.set_attribute("nds.export.suppressed", true);
+    }
+    Ok(span)
+}
+/// Instrument the entire delivery operation, including native credential reads.
+/// Descendant events stay local; descendant native spans must not export either.
+/// The marker follows tracing parents across async and blocking workers.
+pub fn delivery_span() -> tracing::Span {
+    let span = tracing::info_span!(target:"nds_telemetry","telemetry.delivery");
+    span.set_attribute("nds.export.suppressed", true);
+    span
+}
+fn current_export_suppressed() -> bool {
+    tracing::Span::current()
+        .with_subscriber(|(id, dispatch)| {
+            dispatch
+                .downcast_ref::<tracing_subscriber::Registry>()
+                .and_then(|registry| registry.span(id))
+                .is_some_and(|span| {
+                    span.extensions()
+                        .get::<Fields>()
+                        .is_some_and(|fields| fields.export_suppressed)
+                })
+        })
+        .unwrap_or(false)
 }
 /// Used by transport owners with a W3C TextMapPropagator; excludes all secrets.
 pub fn trace_context(span: &tracing::Span) -> Context {
@@ -916,6 +998,66 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn private_fields_and_delivery_feedback_stay_out_of_bounded_export_feed() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder().build();
+        let (subscriber, control) = subscriber(
+            config(),
+            Capture(output.clone()),
+            provider.tracer("export-feed"),
+        )
+        .unwrap();
+        let feed = control.subscribe().unwrap();
+        assert!(control.subscribe().is_err());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                event.name = "client.acceptance",
+                authorization = "PRIVATE_AUTHORIZATION_MUST_NEVER_EXPORT",
+                outcome = "ok"
+            );
+            tracing::info!(
+                event.name = "identity.request_completed",
+                route = "/v2/observability/events",
+                outcome = "ok"
+            );
+            delivery_span().in_scope(|| {
+                operation_span("accounts", "io").unwrap().in_scope(|| {
+                    assert!(current_export_suppressed());
+                    tracing::info!(event.name = "identity.credential.read", outcome = "ok");
+                });
+            });
+        });
+        for _ in 0..300 {
+            control.report_client_lifecycle(view::ClientLifecycle::Ready);
+        }
+        assert!(feed.health().pending <= 128 && feed.health().dropped > 0);
+        let mut events = 0;
+        while let Some(batch) = feed.take_batch() {
+            let count = batch.count();
+            assert!(batch.bytes().len() <= 65_536 && count <= 32);
+            let text = std::str::from_utf8(batch.bytes()).unwrap();
+            assert!(
+                !text.contains("PRIVATE_AUTHORIZATION")
+                    && !text.contains("/v2/observability/")
+                    && !text.contains("identity.credential.read")
+            );
+            for line in text.lines() {
+                decode_event(serde_json::from_str(line).unwrap()).unwrap();
+            }
+            batch.acknowledge();
+            events += count;
+        }
+        assert!(
+            String::from_utf8(output.lock().unwrap().clone())
+                .unwrap()
+                .contains("identity.credential.read")
+        );
+        assert_eq!(feed.health().delivered, u64::from(events));
+        drop(feed);
+        assert!(control.subscribe().is_ok());
+    }
+
     fn config() -> Config {
         Config {
             service: "generated-sdk-acceptance".into(),
