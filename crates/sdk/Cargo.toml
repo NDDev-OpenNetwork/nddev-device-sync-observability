@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.5"
+version = "0.0.1-alpha.6"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -35,3 +35,12 @@ android_log-sys = "=0.3.2"
 [dev-dependencies]
 prost = "0.14"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "=0.4.79"
+gloo-timers = { version = "0.3", features = ["futures"] }
+futures = "0.3"
+web-time = "1.1"
+uuid = { version = "1.27", features = ["js"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "wasmbind"] }

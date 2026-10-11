@@ -5,6 +5,8 @@ use opentelemetry::{
 };
 use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
 use serde_json::{Map, Value};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use std::{
     fmt,
     io::Write,
@@ -12,7 +14,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tracing::{
     Event, Level, Subscriber,
@@ -20,6 +22,8 @@ use tracing::{
     span::{Attributes, Id, Record},
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 #[cfg(feature = "otlp")]
 pub mod otlp;
@@ -804,7 +808,10 @@ pub struct Logger {
     pub control: Control<LocalWriter>,
     worker: Option<output::Worker>,
     provider: Option<SdkTracerProvider>,
+    #[cfg(not(target_arch = "wasm32"))]
     expiry: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+    #[cfg(target_arch = "wasm32")]
+    expiry: Option<futures::future::AbortHandle>,
 }
 impl Drop for Logger {
     fn drop(&mut self) {
@@ -818,9 +825,14 @@ impl Logger {
         if self.worker.is_none() {
             return;
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some((cancel, thread)) = self.expiry.take() {
             let _ = cancel.send(());
             let _ = thread.join();
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(cancel) = self.expiry.take() {
+            cancel.abort();
         }
         self.control.shared.disable_debug("process_exit");
         self.control.shared.emit(
@@ -876,50 +888,72 @@ pub fn install_with_tracer_to(
         "info",
     );
     let shared = control.shared.clone();
-    let (cancel, receiver) = std::sync::mpsc::channel();
-    let thread = std::thread::spawn(move || {
-        let mut heartbeat = Instant::now();
-        while matches!(
-            receiver.recv_timeout(Duration::from_secs(1)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ) {
-            shared.debug_tick();
-            if heartbeat.elapsed() >= Duration::from_secs(30) {
-                shared.emit(
-                    Map::from_iter([
-                        ("event.name".into(), "process.heartbeat".into()),
-                        ("module".into(), "process".into()),
-                        (
-                            "outcome".into(),
-                            if output.snapshot().dropped_events > 0 {
-                                "error"
-                            } else {
-                                "ok"
-                            }
-                            .into(),
-                        ),
-                        (
-                            "dropped_count".into(),
-                            output.snapshot().dropped_events.into(),
-                        ),
-                    ]),
-                    if output.snapshot().dropped_events > 0 {
-                        "warn"
-                    } else {
-                        "info"
-                    },
-                );
-                heartbeat = Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let expiry = {
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut heartbeat = Instant::now();
+            while matches!(
+                receiver.recv_timeout(Duration::from_secs(1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                lifecycle_tick(&shared, &output, &mut heartbeat);
             }
-        }
-    });
-    let expiry = Some((cancel, thread));
+        });
+        Some((cancel, thread))
+    };
+    #[cfg(target_arch = "wasm32")]
+    let expiry = {
+        let (cancel, registration) = futures::future::AbortHandle::new_pair();
+        wasm_bindgen_futures::spawn_local(async move {
+            let work = async move {
+                let mut heartbeat = Instant::now();
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(1000).await;
+                    lifecycle_tick(&shared, &output, &mut heartbeat);
+                }
+            };
+            let _ = futures::future::Abortable::new(work, registration).await;
+        });
+        Some(cancel)
+    };
     Ok(Logger {
         control,
         provider: None,
         worker: Some(worker),
         expiry,
     })
+}
+
+fn lifecycle_tick(shared: &Shared<LocalWriter>, output: &output::State, heartbeat: &mut Instant) {
+    shared.debug_tick();
+    if heartbeat.elapsed() >= Duration::from_secs(30) {
+        shared.emit(
+            Map::from_iter([
+                ("event.name".into(), "process.heartbeat".into()),
+                ("module".into(), "process".into()),
+                (
+                    "outcome".into(),
+                    if output.snapshot().dropped_events > 0 {
+                        "error"
+                    } else {
+                        "ok"
+                    }
+                    .into(),
+                ),
+                (
+                    "dropped_count".into(),
+                    output.snapshot().dropped_events.into(),
+                ),
+            ]),
+            if output.snapshot().dropped_events > 0 {
+                "warn"
+            } else {
+                "info"
+            },
+        );
+        *heartbeat = Instant::now();
+    }
 }
 
 /// A real operation span with a validated, bounded module label. Instrument the
