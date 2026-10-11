@@ -29,6 +29,8 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
+mod feed;
+pub use feed::{EventFeed, FeedHealth};
 mod output;
 pub use output::{LocalWriter, OutputHealth};
 mod http;
@@ -326,6 +328,7 @@ struct ActiveDebug {
     remaining: u64,
 }
 struct Shared<W> {
+    feed: feed::Router,
     policy: Policy,
     sink: Mutex<Sink<W>>,
     rejected: AtomicU64,
@@ -382,6 +385,15 @@ impl<W: Write> Shared<W> {
             return;
         }
         bytes.push(b'\n');
+        // Delivery operations keep local diagnostics but never feed themselves.
+        if !fields
+            .get("route")
+            .and_then(Value::as_str)
+            .is_some_and(|route| route.starts_with("/v2/observability/"))
+            && fields.get("module").and_then(Value::as_str) != Some("telemetry")
+        {
+            self.feed.enqueue(&fields);
+        }
         if sink.writer.write_all(&bytes).is_err() {
             self.write_failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -592,6 +604,9 @@ impl<W: Write> Clone for Control<W> {
     }
 }
 impl<W: Write> Control<W> {
+    pub fn subscribe(&self) -> Result<EventFeed, Error> {
+        self.shared.feed.subscribe()
+    }
     pub fn report_client_lifecycle(&self, state: view::ClientLifecycle) {
         self.shared.emit(
             Map::from_iter([
@@ -712,6 +727,7 @@ pub fn subscriber<W: Write + Send + Sync + 'static>(
 ) -> Result<(impl Subscriber + Send + Sync, Control<W>), Error> {
     let policy = Policy::new(&config)?;
     let shared = Arc::new(Shared {
+        feed: feed::Router::default(),
         policy,
         sink: Mutex::new(Sink {
             writer,
@@ -916,6 +932,48 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn private_fields_and_delivery_feedback_stay_out_of_bounded_export_feed() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder().build();
+        let (subscriber, control) =
+            subscriber(config(), Capture(output), provider.tracer("export-feed")).unwrap();
+        let feed = control.subscribe().unwrap();
+        assert!(control.subscribe().is_err());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                event.name = "client.acceptance",
+                authorization = "PRIVATE_AUTHORIZATION_MUST_NEVER_EXPORT",
+                outcome = "ok"
+            );
+            tracing::info!(
+                event.name = "identity.request_completed",
+                route = "/v2/observability/events",
+                outcome = "ok"
+            );
+        });
+        for _ in 0..300 {
+            control.report_client_lifecycle(view::ClientLifecycle::Ready);
+        }
+        assert!(feed.health().pending <= 128 && feed.health().dropped > 0);
+        let mut events = 0;
+        while let Some((bytes, count)) = feed.take_batch() {
+            assert!(bytes.len() <= 65_536 && count <= 32);
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                !text.contains("PRIVATE_AUTHORIZATION") && !text.contains("/v2/observability/")
+            );
+            for line in text.lines() {
+                decode_event(serde_json::from_str(line).unwrap()).unwrap();
+            }
+            feed.delivered(count);
+            events += count;
+        }
+        assert_eq!(feed.health().delivered, u64::from(events));
+        drop(feed);
+        assert!(control.subscribe().is_ok());
+    }
+
     fn config() -> Config {
         Config {
             service: "generated-sdk-acceptance".into(),
