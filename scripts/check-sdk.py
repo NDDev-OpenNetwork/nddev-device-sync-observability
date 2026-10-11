@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise actual concurrent process stdout, without retaining runtime events."""
+import os
 import json
 import pathlib
 import subprocess
@@ -55,3 +56,17 @@ try:
 finally:
     if blocked.poll() is None:blocked.kill();blocked.wait(timeout=2)
     blocked.stdout.close();blocked.stderr.close()
+
+cli=subprocess.run([ROOT/'target/debug/examples/sdk_probe','--stderr'],capture_output=True,check=True,timeout=5)
+assert json.loads(cli.stdout)=={'result':'ok'}
+assert len(cli.stderr)<128*1024
+cli_events=[json.loads(line) for line in cli.stderr.splitlines()]
+assert any(event['event.name']=='client.ready' for event in cli_events)
+assert any(event['event.name']=='process.stopped' for event in cli_events)
+print('SDK CLI output: one stdout result, canonical lifecycle diagnostics on bounded stderr')
+
+if os.name == 'posix':
+    unavailable=subprocess.run([ROOT/'target/debug/examples/sdk_probe','--closed-stdout-panic'],capture_output=True,timeout=5)
+    assert unavailable.returncode != 0
+    assert not unavailable.stdout and not unavailable.stderr
+    print('SDK unavailable sink: subsequent real panic exposes neither payload nor stack')
