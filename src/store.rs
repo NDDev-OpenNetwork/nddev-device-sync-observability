@@ -83,12 +83,13 @@ impl PgRepository {
             .await
             .map_err(unavailable)?;
         repo.budget(&mut tx).await?;
-        let retained: Vec<String> =
-            sqlx::query_scalar("SELECT service_name FROM sources WHERE tenant_id=$1 LIMIT 17")
-                .bind(&*repo.tenant)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(unavailable)?;
+        let retained: Vec<String> = sqlx::query_scalar(
+            "SELECT service_name FROM sources WHERE tenant_id=$1 AND required LIMIT 17",
+        )
+        .bind(&*repo.tenant)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unavailable)?;
         let total: std::collections::BTreeSet<_> =
             retained.iter().chain(repo.expected.iter()).collect();
         if total.len() > 16 {
@@ -110,7 +111,7 @@ impl PgRepository {
 
     pub async fn ready(&self) -> Result<(), Error> {
         let current: bool =
-            sqlx::query_scalar("SELECT value='1' FROM nds_observability_meta WHERE key='schema'")
+            sqlx::query_scalar("SELECT value='2' FROM nds_observability_meta WHERE key='schema'")
                 .fetch_one(&self.pool)
                 .await
                 .map_err(unavailable)?;
@@ -305,7 +306,14 @@ impl Repository for PgRepository {
         let mut accepted = 0;
         let mut duplicates = 0;
         for event in events {
-            if event.service != OWN_SERVICE && !self.expected.iter().any(|s| s == &event.service) {
+            let client = matches!(
+                event.service.as_str(),
+                "nddev-device-sync-client" | "nddev-device-sync-agent"
+            );
+            if !client
+                && event.service != OWN_SERVICE
+                && !self.expected.iter().any(|s| s == &event.service)
+            {
                 return Err(Error::Invalid);
             }
             let inserted=sqlx::query("INSERT INTO event_receipts(tenant_id,event_id,expires_at,payload,received_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
@@ -324,36 +332,96 @@ impl Repository for PgRepository {
                     return Err(Error::Capacity);
                 }
             }
-            let source=sqlx::query("SELECT instance_id::text,last_sequence FROM sources WHERE tenant_id=$1 AND service_name=$2 FOR UPDATE")
-                .bind(&*self.tenant).bind(&event.service).fetch_one(&mut *tx).await.map_err(unavailable)?;
-            let old_instance: Option<String> =
-                source.try_get("instance_id").map_err(unavailable)?;
-            let old_sequence: Option<i64> = source.try_get("last_sequence").map_err(unavailable)?;
-            let gap = event.instance.is_some()
-                && old_instance == event.instance
-                && event
+            let (service, gap) = if client {
+                let device = event.device.as_deref().ok_or(Error::Invalid)?;
+                let instance = event.instance.as_deref().ok_or(Error::Invalid)?;
+                let sequence = event
                     .sequence
-                    .zip(old_sequence)
-                    .is_some_and(|(a, b)| a != b.saturating_add(1));
-            sqlx::query("UPDATE sources SET last_received_at=$3,last_event_at=$4,instance_id=$5::uuid,last_sequence=$6,gap_observations=LEAST(gap_observations+$7,9007199254740991),gap_active=$8 WHERE tenant_id=$1 AND service_name=$2")
-                .bind(&*self.tenant).bind(&event.service).bind(now).bind(instant(event.timestamp_ms)?).bind(&event.instance).bind(event.sequence).bind(if gap {1_i64}else{0_i64}).bind(gap).execute(&mut *tx).await.map_err(unavailable)?;
-            if gap {
-                self.condition(
-                    &mut tx,
-                    &event.service,
-                    "source_gap",
-                    Condition::Failed,
-                    now,
+                    .filter(|sequence| *sequence > 0)
+                    .ok_or(Error::Invalid)?;
+                // Device-bound client sources have no always-on liveness promise.
+                // Producer rows separate concurrent app/CLI streams on one device.
+                use sha2::{Digest, Sha256};
+                let digest = format!("{:x}", Sha256::digest(device.as_bytes()));
+                let service = format!("{}.{}", event.service, &digest[..24]);
+                let known: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM sources WHERE tenant_id=$1 AND service_name=$2)",
                 )
-                .await?;
+                .bind(&*self.tenant)
+                .bind(&service)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(unavailable)?;
+                if !known {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM sources WHERE tenant_id=$1 AND NOT required",
+                    )
+                    .bind(&*self.tenant)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(unavailable)?;
+                    if count >= 64 {
+                        return Err(Error::Capacity);
+                    }
+                    sqlx::query(
+                        "INSERT INTO sources(tenant_id,service_name,required) VALUES($1,$2,false)",
+                    )
+                    .bind(&*self.tenant)
+                    .bind(&service)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(unavailable)?;
+                }
+                sqlx::query("DELETE FROM client_producers WHERE tenant_id=$1 AND last_received_at<$2-interval '1 hour'").bind(&*self.tenant).bind(now).execute(&mut *tx).await.map_err(unavailable)?;
+                let previous:Option<(String,i64)>=sqlx::query_as("SELECT service_name,last_sequence FROM client_producers WHERE tenant_id=$1 AND instance_id=$2::uuid FOR UPDATE").bind(&*self.tenant).bind(instance).fetch_optional(&mut *tx).await.map_err(unavailable)?;
+                if previous
+                    .as_ref()
+                    .is_some_and(|(stored, last)| stored != &service || sequence <= *last)
+                {
+                    return Err(Error::Invalid);
+                }
+                if previous.is_none() {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM client_producers WHERE tenant_id=$1",
+                    )
+                    .bind(&*self.tenant)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(unavailable)?;
+                    if count >= 4096 {
+                        return Err(Error::Capacity);
+                    }
+                }
+                let gap = previous.is_some_and(|(_, last)| sequence != last.saturating_add(1));
+                sqlx::query("INSERT INTO client_producers(tenant_id,instance_id,service_name,last_sequence,last_received_at) VALUES($1,$2::uuid,$3,$4,$5) ON CONFLICT(tenant_id,instance_id) DO UPDATE SET last_sequence=EXCLUDED.last_sequence,last_received_at=EXCLUDED.last_received_at").bind(&*self.tenant).bind(instance).bind(&service).bind(sequence).bind(now).execute(&mut *tx).await.map_err(unavailable)?;
+                sqlx::query("UPDATE sources SET last_received_at=$3,last_event_at=$4,gap_observations=LEAST(gap_observations+$5,9007199254740991),gap_active=$6 WHERE tenant_id=$1 AND service_name=$2").bind(&*self.tenant).bind(&service).bind(now).bind(instant(event.timestamp_ms)?).bind(if gap{1_i64}else{0_i64}).bind(gap).execute(&mut *tx).await.map_err(unavailable)?;
+                (service, gap)
+            } else {
+                let source=sqlx::query("SELECT instance_id::text,last_sequence FROM sources WHERE tenant_id=$1 AND service_name=$2 FOR UPDATE").bind(&*self.tenant).bind(&event.service).fetch_one(&mut *tx).await.map_err(unavailable)?;
+                let old_instance: Option<String> =
+                    source.try_get("instance_id").map_err(unavailable)?;
+                let old_sequence: Option<i64> =
+                    source.try_get("last_sequence").map_err(unavailable)?;
+                let gap = event.instance.is_some()
+                    && old_instance == event.instance
+                    && event
+                        .sequence
+                        .zip(old_sequence)
+                        .is_some_and(|(a, b)| a != b.saturating_add(1));
+                sqlx::query("UPDATE sources SET last_received_at=$3,last_event_at=$4,instance_id=$5::uuid,last_sequence=$6,gap_observations=LEAST(gap_observations+$7,9007199254740991),gap_active=$8 WHERE tenant_id=$1 AND service_name=$2").bind(&*self.tenant).bind(&event.service).bind(now).bind(instant(event.timestamp_ms)?).bind(&event.instance).bind(event.sequence).bind(if gap{1_i64}else{0_i64}).bind(gap).execute(&mut *tx).await.map_err(unavailable)?;
+                (event.service.clone(), gap)
+            };
+            if gap {
+                self.condition(&mut tx, &service, "source_gap", Condition::Failed, now)
+                    .await?;
             }
-            if let Some((kind, state)) = domain::condition(
+            if let Some((kind, condition)) = domain::condition(
                 &event.event_name,
                 event.resource.as_deref(),
                 event.route.as_deref(),
                 event.status,
             ) {
-                self.condition(&mut tx, &event.service, kind, state, now)
+                self.condition(&mut tx, &service, kind, condition, now)
                     .await?;
             }
             accepted += 1;

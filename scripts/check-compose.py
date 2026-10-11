@@ -194,6 +194,21 @@ def main():
             observed=eventually(lambda:search('nds','logs',"trace_id='"+failure['trace_id']+"'"))
             assert any(row.get('error_type',row.get('error.type'))=='flutter_framework_error' for row in observed)
             print('Actual shared SDK client failure searchable: one incident, duplicate replay retained, readiness resolved it')
+            # The real SDK's frames pass the same context enrichment boundary
+            # supplied by an authenticated gateway, not an always-on source.
+            import hashlib
+            device=str(uuid.uuid4())
+            device_source='nddev-device-sync-client.'+hashlib.sha256(device.encode()).hexdigest()[:24]
+            device_cycle=[event | {'service.name':'nddev-device-sync-client','device.id':device,'producer.instance_id':str(uuid.uuid5(uuid.NAMESPACE_OID,event['producer.instance_id']+device))} for event in cycle]
+            assert ingest(device_cycle[:ready_index])['accepted']==ready_index
+            device_incident=eventually(lambda:next((row for row in incidents() if row['service_name']==device_source and row['kind']=='process' and row['state']=='open'),None))
+            assert ingest(device_cycle[:ready_index])['duplicates']==ready_index
+            assert ingest(device_cycle[ready_index:])['accepted']==len(device_cycle)-ready_index
+            eventually(lambda:any(row['incident_id']==device_incident['incident_id'] and row['state']=='resolved' for row in incidents()))
+            assert device_source not in {source['service_name'] for source in status()['sources']}
+            assert sql('postgres',"SELECT count(*) FROM client_producers WHERE service_name='"+device_source+"'")== '1'
+            print('Actual SDK client stream: device-scoped incident, producer replay/sequence and optional liveness passed')
+
             if client_events:
                 for start in range(0,len(client_events),100):ingest(client_events[start:start+100])
                 for kind in ['flutter_framework_error','dart_unhandled_error']:
@@ -286,14 +301,14 @@ def main():
             registration_name=project+'-registration'
             compose('run','--detach','--rm','--no-deps','--name',registration_name,'--env','NDS_EXPECTED_SOURCES='+retained,'--env','NDS_TELEMETRY_ENABLED=false','observability')
             try:
-                eventually(lambda:sql('postgres','SELECT count(*) FROM sources')=='16')
+                eventually(lambda:sql('postgres','SELECT count(*) FROM sources WHERE required')=='16')
             finally:command('docker','stop','--time','15',registration_name,check=False,timeout=20)
             compose('restart','observability',timeout=30)
             eventually(lambda:request(obs+'/v1/ready')[0]==200)
             sources=status()['sources'];assert len(sources)==16 and sum(row['state']=='inactive' for row in sources)==16-len(source_names)
             rejected=compose('run','--rm','--no-deps','--env','NDS_EXPECTED_SOURCES=unregistered-source','--env','NDS_TELEMETRY_ENABLED=false','observability',check=False,timeout=20)
             assert rejected.returncode!=0
-            assert sql('postgres','SELECT count(*) FROM sources')=='16'
+            assert sql('postgres','SELECT count(*) FROM sources WHERE required')=='16'
             print('Real PostgreSQL source registration: canonical set capped at16, retained inactive rows visible after restart,17th source refused transactionally')
             sql('postgres',"UPDATE delivery_state SET time_floor=clock_timestamp()+interval '2 hours'")
             eventually(lambda:sql('postgres','SELECT count(*) FROM incident_actions')=='0')

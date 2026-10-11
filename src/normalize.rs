@@ -33,6 +33,7 @@ pub fn accept(
         route: event.route.clone(),
         status: event.status,
         timestamp_ms: time.timestamp_millis(),
+        device: event.device_id.clone(),
         instance: event.producer_instance_id.clone(),
         sequence: event.producer_sequence,
     };

@@ -423,7 +423,7 @@ async fn snapshot(app: &App) -> Result<wire::ObservabilityStatus, Error> {
         .await
         .map_err(|_| Error::Unavailable)?;
     let rows = sqlx::query(
-        "SELECT *,service_name=ANY($2) AS configured FROM sources WHERE tenant_id=$1 ORDER BY service_name LIMIT 16",
+        "SELECT *,service_name=ANY($2) AS configured FROM sources WHERE tenant_id=$1 AND required ORDER BY service_name LIMIT 16",
     )
     .bind(&*app.repository.tenant)
     .bind(app.repository.expected.as_ref())

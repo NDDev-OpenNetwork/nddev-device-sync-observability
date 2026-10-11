@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-observability"
-version = "0.0.1-alpha.2"
+version = "0.0.1-alpha.3"
 dependencies = [
  "axum",
  "chrono",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "android_log-sys",
  "chrono",
