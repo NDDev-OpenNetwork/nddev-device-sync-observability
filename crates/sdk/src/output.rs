@@ -2,26 +2,32 @@
 //! shutdown waits at most one second, then detaches this single worker until the
 //! process exits. No flush/delivery is promised for a full or broken pipe.
 use crate::MAX_EVENT_BYTES;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
 use std::fs::File;
 use std::{
     io::{self, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender},
     },
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    sync::mpsc::{self, Receiver, SyncSender},
     time::Duration,
 };
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_arch = "wasm32")]
+mod browser;
 /// Desktop CLI results can reserve stdout for one machine-readable response.
-/// Android always uses its native Logcat sink.
+/// Android uses Logcat; browsers use the console, preserving the same envelope.
 #[derive(Clone, Copy)]
 pub enum LocalOutput {
     Stdout,
     Stderr,
 }
+#[cfg(not(target_arch = "wasm32"))]
 const CAPACITY: usize = 128;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 fn add(counter: &AtomicU64) {
@@ -59,6 +65,7 @@ impl State {
 }
 #[derive(Clone)]
 pub struct LocalWriter {
+    #[cfg(not(target_arch = "wasm32"))]
     sender: SyncSender<Option<Vec<u8>>>,
     pub(crate) state: Arc<State>,
 }
@@ -76,14 +83,28 @@ impl Write for LocalWriter {
             if self.state.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
                 // Shutdown may have seen this final reservation while consuming
                 // its wake-up. Notify it again when no payload will follow.
+                #[cfg(not(target_arch = "wasm32"))]
                 let _ = self.sender.try_send(None);
             }
             add(&self.state.dropped);
             return Err(io::Error::other("telemetry output terminated"));
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if self.sender.try_send(Some(bytes.to_vec())).is_err() {
             self.state.pending.fetch_sub(1, Ordering::SeqCst);
             add(&self.state.dropped);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Console emission is synchronous; no native worker/pipe exists in
+            // the browser. Only already-redacted complete envelopes reach JS.
+            let result = std::str::from_utf8(bytes).ok().is_some_and(browser::write);
+            self.state.pending.fetch_sub(1, Ordering::SeqCst);
+            if !result {
+                add(&self.state.failures);
+                add(&self.state.dropped);
+                return Err(io::Error::other("telemetry console unavailable"));
+            }
         }
         Ok(bytes.len())
     }
@@ -93,7 +114,7 @@ impl Write for LocalWriter {
 }
 /// Separate OS handle avoids holding Rust's global stdout lock, which its process
 /// exit cleanup also acquires. This is essential with an undrained stdout pipe.
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
 fn output_file(destination: LocalOutput) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -114,6 +135,7 @@ fn output_file(destination: LocalOutput) -> io::Result<File> {
 }
 pub(crate) struct Worker {
     writer: LocalWriter,
+    #[cfg(not(target_arch = "wasm32"))]
     done: Receiver<()>,
     closed: bool,
 }
@@ -126,9 +148,12 @@ impl Worker {
         self.writer.state.terminating.store(true, Ordering::SeqCst);
         // A full queue already has a wake-up. After draining it the worker sees
         // terminating and exits after all previously admitted writers finish.
-        let _ = self.writer.sender.try_send(None);
-        if self.done.recv_timeout(Duration::from_secs(1)).is_err() {
-            self.writer.state.incomplete.store(true, Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.writer.sender.try_send(None);
+            if self.done.recv_timeout(Duration::from_secs(1)).is_err() {
+                self.writer.state.incomplete.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -137,6 +162,7 @@ impl Drop for Worker {
         self.close();
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn start(destination: LocalOutput) -> io::Result<(LocalWriter, Worker)> {
     #[cfg(not(target_os = "android"))]
     let mut output = output_file(destination)?;
@@ -179,6 +205,20 @@ pub(crate) fn start(destination: LocalOutput) -> io::Result<(LocalWriter, Worker
         Worker {
             writer,
             done: completion,
+            closed: false,
+        },
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn start(_: LocalOutput) -> io::Result<(LocalWriter, Worker)> {
+    let writer = LocalWriter {
+        state: Arc::default(),
+    };
+    Ok((
+        writer.clone(),
+        Worker {
+            writer,
             closed: false,
         },
     ))
