@@ -98,6 +98,10 @@ fn actual_http_otlp_retries_and_exports_only_projected_native_spans() {
             tracing::event!(target:"nds_acceptance",tracing::Level::INFO,{event.name="acceptance.completed",outcome="ok"});
             finish_http_server_span(&span, 200).unwrap();
         });
+        nddev_device_sync_telemetry::delivery_span().in_scope(|| {
+            let _credential_read =
+                nddev_device_sync_telemetry::operation_span("accounts", "io").unwrap();
+        });
     });
     native.flush().unwrap();
     let received = receiver.join().unwrap();
