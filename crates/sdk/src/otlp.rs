@@ -1,7 +1,7 @@
 //! Optional native OTLP/HTTP egress for trusted process adapters. No collector
 //! account is embedded. Mobile ingress authentication belongs to its transport.
 use crate::{Config, Error};
-use opentelemetry::{Context, KeyValue, trace::TracerProvider as _};
+use opentelemetry::{Context, trace::TracerProvider as _};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     Resource,
@@ -79,7 +79,7 @@ impl SpanProcessor for BoundedProcessor {
         self.inner.on_start(span, context);
     }
     fn on_end(&self, mut span: SpanData) {
-        if !span.span_context.is_sampled() {
+        if !crate::span::project(&mut span) {
             return;
         }
         let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
@@ -94,35 +94,6 @@ impl SpanProcessor for BoundedProcessor {
         {
             self.delivery.dropped.fetch_add(1, Ordering::Relaxed);
             return;
-        }
-        // An explicit projection applies to native spans too. Raw events,
-        // exception prose, baggage, links and identity labels are never exported.
-        span.events.events.clear();
-        span.links.links.clear();
-        // W3C trace IDs preserve causality. Vendor tracestate is arbitrary
-        // remote input and is outside the canonical public attribute projection.
-        span.span_context = opentelemetry::trace::SpanContext::new(
-            span.span_context.trace_id(),
-            span.span_context.span_id(),
-            span.span_context.trace_flags(),
-            span.span_context.is_remote(),
-            opentelemetry::trace::TraceState::default(),
-        );
-        if !matches!(span.name.as_ref(), "http.request" | "module.operation") {
-            span.name = "module.operation".into();
-        }
-        span.attributes.retain(|attribute| {
-            matches!(
-                attribute.key.as_str(),
-                "module"
-                    | "scope"
-                    | "http.request.method"
-                    | "http.route"
-                    | "http.response.status_code"
-            )
-        });
-        if matches!(span.status, opentelemetry::trace::Status::Error { .. }) {
-            span.status = opentelemetry::trace::Status::error("");
         }
         self.inner.on_end(span);
     }
@@ -204,15 +175,7 @@ impl NativeTraces {
             .build(),
             delivery: delivery.clone(),
         };
-        let resource = Resource::builder_empty()
-            .with_attributes([
-                KeyValue::new("service.name", config.service.clone()),
-                KeyValue::new("service.version", config.version.clone()),
-                KeyValue::new("source.repository", config.repository.clone()),
-                KeyValue::new("source.commit", config.commit.clone()),
-                KeyValue::new("deployment.environment.name", config.environment.clone()),
-            ])
-            .build();
+        let resource = crate::span::resource(config);
         let provider = SdkTracerProvider::builder()
             .with_resource(resource)
             .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))

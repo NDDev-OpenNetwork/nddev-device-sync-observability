@@ -30,6 +30,16 @@ not the business sync operation log. Incident action receipts also retain one
 hour; timestamped operation IDs and a persisted monotonic observed-time floor
 prevent an expired operation from becoming new again after clock rollback.
 
+Native clients can subscribe to SDK-owned event and actual OTLP span feeds.
+Each feed bounds queued plus in-flight records to 128, batches to 32 records /
+64 KiB and retention to 30 minutes. Batch ownership accounts for cancellation,
+expiry and opt-out without duplicate loss counts. Delivery spans retain local
+credential diagnostics but cannot recursively enter either export feed. The
+`client-traces` feature validates a closed native protobuf projection and lets
+the authenticated server attach tenant/user/device ownership. Feed acceptance
+is a transport receipt, not proof of searchable OpenObserve delivery. Accounts
+and server adapters own that end-to-end transport and its qualification.
+
 The shared `crates/sdk` package owns schema projection, redaction, real operation
 span context and bounded debug windows. The collector consumes the same generated
 event DTO and validator; it adds ingress freshness/admission rules. The SDK also
