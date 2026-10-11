@@ -64,11 +64,19 @@ at 3,900 bytes; larger records or native rejections count as write failures and
 loss, with no truncation. Admitted debug records use the native INFO transport
 priority while retaining JSON severity; process-global log filters stay intact.
 Native acceptance does not promise durable storage or later retrieval.
+The WebAssembly SDK uses the same envelope, redaction, native span projection
+and feed bounds. Its local sink writes complete immutable JSON to the browser
+console and counts write failures; an abortable browser timer owns debug expiry
+and heartbeat. It does not create an OS thread or block browser shutdown.
+Console output and a compiled WASM target do not prove persistent offline export
+or remote collection; browser applications own that separate acceptance.
 For the real Android sink check, select an owned running device explicitly:
 `python3 scripts/check-android-sdk.py --serial SERIAL --ndk ANDROID_NDK_PATH`.
 It checks the native SDK process; production Flutter APK acceptance is separate.
 
 Run `just check`, `just protocol-check`, `just sdk-check` and `just integration`.
+`just sdk-wasm-check` checks the stable Rust browser target; it is a compilation
+gate, separate from real browser execution and pipeline qualification.
 Integration requires Docker Engine >=28.2.0 for finite Fluent write timeouts;
 CI pins 29.9.0. It builds an
 immutable existing server checkout snapshot and starts only temporary generated
