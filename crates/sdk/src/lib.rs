@@ -36,7 +36,7 @@ mod feed;
 mod span;
 pub use feed::{ExportBatch, ExportFeed, FeedHealth};
 mod output;
-pub use output::{LocalWriter, OutputHealth};
+pub use output::{LocalOutput, LocalWriter, OutputHealth};
 mod http;
 pub use http::{finish_http_server_span, http_server_span};
 mod contract;
@@ -847,9 +847,17 @@ pub fn install(config: Config) -> Result<Logger, Error> {
     Ok(logger)
 }
 pub fn install_with_tracer(config: Config, tracer: Tracer) -> Result<Logger, Error> {
+    install_with_tracer_to(config, tracer, LocalOutput::Stdout)
+}
+/// Same bounded native sink and lifecycle, with an explicit CLI output stream.
+pub fn install_with_tracer_to(
+    config: Config,
+    tracer: Tracer,
+    output: LocalOutput,
+) -> Result<Logger, Error> {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.set(()).map_err(|_| Error)?;
-    let (writer, worker) = output::start().map_err(|_| Error)?;
+    let (writer, worker) = output::start(output).map_err(|_| Error)?;
     let output = writer.state.clone();
     let (subscriber, mut control) = subscriber(config, writer, tracer)?;
     control.output = Some(output.clone());

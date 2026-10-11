@@ -15,6 +15,13 @@ use std::{
 };
 #[cfg(target_os = "android")]
 mod android;
+/// Desktop CLI results can reserve stdout for one machine-readable response.
+/// Android always uses its native Logcat sink.
+#[derive(Clone, Copy)]
+pub enum LocalOutput {
+    Stdout,
+    Stderr,
+}
 const CAPACITY: usize = 128;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 fn add(counter: &AtomicU64) {
@@ -87,16 +94,22 @@ impl Write for LocalWriter {
 /// Separate OS handle avoids holding Rust's global stdout lock, which its process
 /// exit cleanup also acquires. This is essential with an undrained stdout pipe.
 #[cfg(not(target_os = "android"))]
-fn stdout_file() -> io::Result<File> {
+fn output_file(destination: LocalOutput) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
-        Ok(File::from(io::stdout().as_fd().try_clone_to_owned()?))
+        Ok(File::from(match destination {
+            LocalOutput::Stdout => io::stdout().as_fd().try_clone_to_owned()?,
+            LocalOutput::Stderr => io::stderr().as_fd().try_clone_to_owned()?,
+        }))
     }
     #[cfg(windows)]
     {
         use std::os::windows::io::AsHandle;
-        Ok(File::from(io::stdout().as_handle().try_clone_to_owned()?))
+        Ok(File::from(match destination {
+            LocalOutput::Stdout => io::stdout().as_handle().try_clone_to_owned()?,
+            LocalOutput::Stderr => io::stderr().as_handle().try_clone_to_owned()?,
+        }))
     }
 }
 pub(crate) struct Worker {
@@ -124,11 +137,14 @@ impl Drop for Worker {
         self.close();
     }
 }
-pub(crate) fn start() -> io::Result<(LocalWriter, Worker)> {
+pub(crate) fn start(destination: LocalOutput) -> io::Result<(LocalWriter, Worker)> {
     #[cfg(not(target_os = "android"))]
-    let mut output = stdout_file()?;
+    let mut output = output_file(destination)?;
     #[cfg(target_os = "android")]
-    let mut output = android::Logcat;
+    let mut output = {
+        let _ = destination;
+        android::Logcat
+    };
     let (sender, receiver) = mpsc::sync_channel::<Option<Vec<u8>>>(CAPACITY);
     let (done, completion) = mpsc::sync_channel(1);
     let state = Arc::new(State::default());

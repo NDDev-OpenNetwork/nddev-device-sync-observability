@@ -2,7 +2,7 @@
 use nddev_device_sync_telemetry::{Config, DebugWindow, install, operation_span};
 use std::time::Duration;
 fn main() {
-    let mut logger = install(Config {
+    let config = Config {
         service: "sdk-acceptance".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         repository: "NDDev-OpenNetwork/nddev-device-sync-observability".into(),
@@ -17,8 +17,28 @@ fn main() {
             duration: Duration::from_secs(1),
             events: 100,
         }),
-    })
+    };
+    use opentelemetry::trace::TracerProvider as _;
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let stderr = std::env::args().nth(1).as_deref() == Some("--stderr");
+    let mut logger = if stderr {
+        nddev_device_sync_telemetry::install_with_tracer_to(
+            config,
+            provider.tracer("nds-telemetry"),
+            nddev_device_sync_telemetry::LocalOutput::Stderr,
+        )
+    } else {
+        install(config)
+    }
     .expect("owned valid config");
+    if stderr {
+        logger
+            .control
+            .report_client_lifecycle(nddev_device_sync_telemetry::view::ClientLifecycle::Ready);
+        logger.shutdown();
+        println!("{{\"result\":\"ok\"}}");
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--client-cycle") {
         logger
             .control
