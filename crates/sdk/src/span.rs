@@ -53,8 +53,16 @@ pub(crate) fn project(span: &mut SpanData) -> bool {
         span.name = "module.operation".into();
     }
     span.attributes.retain(|field| {
+        if !matches!(
+            field.key.as_str(),
+            "module" | "scope" | "http.request.method" | "http.route" | "http.response.status_code"
+        ) {
+            return false;
+        }
         let value = match &field.value {
-            Value::String(value) => serde_json::Value::String(value.to_string()),
+            Value::String(value) if value.as_str().len() <= 128 => {
+                serde_json::Value::String(value.to_string())
+            }
             Value::I64(value) => (*value).into(),
             _ => return false,
         };

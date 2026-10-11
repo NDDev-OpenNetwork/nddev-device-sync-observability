@@ -2,6 +2,7 @@
 """Isolated real pipeline acceptance. All accounts, credentials and events are owned
 runtime input. No provider accounts, machine inventory or evidence enter the tree.
 """
+import argparse
 import base64
 import datetime
 import concurrent.futures
@@ -74,6 +75,12 @@ def eventually(predicate,seconds=45):
     raise AssertionError('bounded acceptance condition timed out')
 
 def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--fixture-receipt',type=pathlib.Path)
+    parser.add_argument('--fixture-seconds',type=int,default=1200)
+    args=parser.parse_args()
+    if not 60 <= args.fixture_seconds <= 3600: parser.error('fixture lifetime must be 60..3600 seconds')
+    if args.fixture_receipt is not None and (not args.fixture_receipt.is_absolute() or args.fixture_receipt.resolve().is_relative_to(ROOT) or args.fixture_receipt.exists()): parser.error('fixture receipt must be a new absolute path outside source')
     command('cargo','build','--locked','-p','nddev-device-sync-telemetry','--example','sdk_probe',cwd=ROOT,timeout=180)
     source_names=['nddev-device-sync-server','nddev-device-sync-observability','sdk-acceptance']
     client_events=[]
@@ -122,6 +129,12 @@ def main():
             'server-migrate':{'image':SERVER_IMAGE,'command':['migrate'],'mem_limit':'256m','read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'environment':{'NDS_MIGRATION_DATABASE_URL_FILE':'/run/secrets/server_migration_url'},'secrets':['server_migration_url'],'networks':['pipeline'],'depends_on':{'server-postgres':{'condition':'service_healthy'}}},
             'server':{'image':SERVER_IMAGE,'command':['serve'],'read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'mem_limit':'512m','pids_limit':64,'environment':{'DATABASE_URL_FILE':'/run/secrets/server_runtime_url','NDS_SERVER_ADDR':'0.0.0.0:8080','NDS_MAX_REQUESTS':'1','NDS_MAX_CONNECTIONS':'4'},'secrets':['server_runtime_url'],'networks':['pipeline'],'depends_on':{'server-migrate':{'condition':'service_completed_successfully'}},'logging':{'driver':'fluentd','options':{'fluentd-address':'127.0.0.1:'+env['NDS_FLUENT_PORT'],'fluentd-async':'true','fluentd-buffer-limit':'256','fluentd-max-retries':'3','fluentd-retry-wait':'1s','fluentd-write-timeout':'2s','fluentd-async-reconnect-interval':'1s','mode':'non-blocking','max-buffer-size':'1m','cache-max-size':'2m','cache-max-file':'2'}}},
         },'secrets':{'server_migration_url':{'file':str(private/'server_migration_url')},'server_runtime_url':{'file':str(private/'server_runtime_url')}}}
+        if args.fixture_receipt is not None:
+            fixture_ports={name:free_port() for name in ['observability','vector','openobserve']}
+            for name,port in [('observability',8080),('vector',4318),('openobserve',5080)]:
+                override['services'].setdefault(name,{})['ports']=[f'127.0.0.1:{fixture_ports[name]}:{port}']
+                override['services'][name]['networks']=['pipeline','collector']
+            env['NDS_SOURCE_STALE_SECONDS']='90'
         override_path=directory/'override.json';override_path.write_text(json.dumps(override))
         prefix=['docker','compose','--project-name',project,'--file',str(ROOT/'deploy/compose.yaml'),'--file',str(override_path)]
         def compose(*args,**kw):return command(*prefix,*args,env=env,**kw)
@@ -144,6 +157,27 @@ def main():
             obs=endpoint('observability',8080);server=endpoint('server',8080)
             eventually(lambda:request(obs+'/v1/ready')[0]==200)
             eventually(lambda:request(server+'/v1/ready')[0]==200)
+            if args.fixture_receipt is not None:
+                # These are generated fixture credentials, never operator files.
+                for name in ['ingest_token','admin_token']:
+                    path=directory/(name+'-host');path.write_text(values[name]);path.chmod(0o600)
+                gateway=directory/'gateway.json'
+                gateway.write_text(json.dumps({'origin':f"http://127.0.0.1:{fixture_ports['observability']}", 'trace_origin':f"http://127.0.0.1:{fixture_ports['vector']}", 'ingest_token_file':str(directory/'ingest_token-host'), 'admin_token_file':str(directory/'admin_token-host')}));gateway.chmod(0o600)
+                query=directory/'query.json';query.write_text(json.dumps({'origin':f"http://127.0.0.1:{fixture_ports['openobserve']}",'user':values['oo_user'],'password':values['oo_password']}));query.chmod(0o600)
+                receipt=args.fixture_receipt;stop=receipt.with_suffix('.stop')
+                state={'status':'running','gateway_config':str(gateway),'query_config':str(query),'project':project,'stop_marker':str(stop),'expires_at_unix':int(time.time())+args.fixture_seconds}
+                with receipt.open('x') as handle: json.dump(state,handle)
+                receipt.chmod(0o600)
+                print('Isolated observability fixture ready; private receipt written outside source.',flush=True)
+                deadline=time.monotonic()+args.fixture_seconds
+                try:
+                    while time.monotonic()<deadline and not stop.exists():
+                        if request(obs+'/v1/ready')[0]!=200: raise AssertionError('owned collector became unavailable')
+                        time.sleep(1)
+                finally:
+                    state['status']='stopped';receipt.write_text(json.dumps(state))
+                return
+
             def status():
                 code,body=request(obs+'/v2/observability/status',token=values['admin_token']);assert code==200;return json.loads(body)
             eventually(lambda:status()['delivered_events']>0)
