@@ -1,5 +1,5 @@
 // Browser I/O for the canonical SDK's already-redacted event/OTLP batches.
-// One origin: <=8 MiB, 4096 records, 256 batches, 16 authenticated scopes.
+// One origin: <=8 MiB, 4096 records (therefore at most 4096 batches), 16 authenticated scopes.
 // Expiry comes from the SDK's original batch lifetime. No credential lives here.
 const DATABASE='nds-telemetry-v1', MAX_COUNTER=Number.MAX_SAFE_INTEGER;
 const scopes=/^[a-f0-9]{64}$/, ids=/^[a-f0-9-]{36}$/;
@@ -131,7 +131,7 @@ export async function queueOperation(scope,command,encoded,input) {
     if(command==='append') {
       const previous=await request(records.get(data.id));
       if(previous)throw failure();
-      if(!current.enabled||data.expires_at_ms<=now||total.batches>=256||total.records+data.count>4096||total.bytes+bytes.length>8*1024*1024) {
+      if(!current.enabled||data.expires_at_ms<=now||total.records+data.count>4096||total.bytes+bytes.length>8*1024*1024) {
         current[data.signal].dropped=increment(current[data.signal].dropped,data.count);
       } else {
         records.add({...data,scope,size:bytes.length,bytes});

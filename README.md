@@ -70,8 +70,8 @@ console and counts write failures; an abortable browser timer owns debug expiry
 and heartbeat. It does not create an OS thread or block browser shutdown.
 Browser clients stage those feeds into a strict IndexedDB transaction before
 network delivery. The spool binds to the caller's verified origin/owner/device
-scope and stores exact redacted JSON or OTLP bytes. Limits are 8 MiB, 4096 records,
-256 batches and 16 scopes per origin; batches retain their original 30-minute
+scope and stores exact redacted JSON or OTLP bytes. Limits are 8 MiB of encoded payloads, 4096 records
+(and therefore at most 4096 batches) and 16 scopes per origin; batches retain their original 30-minute
 eligibility and durable retry counts. A short in-flight grace permits a bounded
 request to settle. A browser-owned sender lock serializes tabs and is released
 between retries. Unknown outcomes may repeat spans with their original IDs;
