@@ -86,6 +86,7 @@ impl ClientTraces {
     pub fn new(config: &Config) -> Result<Self, Error> {
         crate::Policy::new(config)?;
         let router = Arc::new(Router::default());
+        router.buffer_startup()?;
         let provider = SdkTracerProvider::builder()
             .with_resource(crate::span::resource(config))
             .with_span_processor(Processor {
