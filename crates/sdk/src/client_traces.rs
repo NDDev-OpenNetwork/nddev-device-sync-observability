@@ -190,7 +190,11 @@ pub fn authenticated_batch(
             if canonical == "source.repository"
                 && !matches!(
                     value.as_str(),
-                    "NDDev-OpenNetwork/nddev-device-sync-desktop"
+                    "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop"
+                        | "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-agent"
+                        // Installed pre-transfer clients and durable batches retain
+                        // their original source identity until they are upgraded.
+                        | "NDDev-OpenNetwork/nddev-device-sync-desktop"
                         | "NDDev-OpenNetwork/nddev-device-sync-agent"
                 )
             {

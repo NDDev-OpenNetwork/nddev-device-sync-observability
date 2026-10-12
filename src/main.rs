@@ -8,7 +8,7 @@ fn main() -> std::process::ExitCode {
     let logging = install(Config {
         service: "nddev-device-sync-observability".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        repository: "NDDev-OpenNetwork/nddev-device-sync-observability".into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability".into(),
         commit: option_env!("NDS_SOURCE_COMMIT").unwrap_or("unknown").into(),
         channel: "alpha".into(),
         standards: "v0.0.1-alpha.9".into(),
