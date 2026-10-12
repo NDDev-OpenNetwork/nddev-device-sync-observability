@@ -30,7 +30,7 @@ not the business sync operation log. Incident action receipts also retain one
 hour; timestamped operation IDs and a persisted monotonic observed-time floor
 prevent an expired operation from becoming new again after clock rollback.
 
-Native clients can subscribe to SDK-owned event and actual OTLP span feeds.
+Clients can subscribe to SDK-owned event and actual OTLP span feeds.
 Each feed bounds queued plus in-flight records to 128, batches to 32 records /
 64 KiB and retention to 30 minutes. Batch ownership accounts for cancellation,
 expiry and opt-out without duplicate loss counts. Delivery spans retain local
@@ -68,8 +68,25 @@ The WebAssembly SDK uses the same envelope, redaction, native span projection
 and feed bounds. Its local sink writes complete immutable JSON to the browser
 console and counts write failures; an abortable browser timer owns debug expiry
 and heartbeat. It does not create an OS thread or block browser shutdown.
-Console output and a compiled WASM target do not prove persistent offline export
-or remote collection; browser applications own that separate acceptance.
+Browser clients stage those feeds into a strict IndexedDB transaction before
+network delivery. The spool binds to the caller's verified origin/owner/device
+scope and stores exact redacted JSON or OTLP bytes. Limits are 8 MiB of encoded payloads, 4096 records
+(and therefore at most 4096 batches) and 16 scopes per origin; batches retain their original 30-minute
+eligibility and durable retry counts. A short in-flight grace permits a bounded
+request to settle. A browser-owned sender lock serializes tabs and is released
+between retries. Unknown outcomes may repeat spans with their original IDs;
+this is not an exactly-once delivery claim. Opt-out discards the scoped queue.
+Counters distinguish queued, durably acknowledged, discarded and failed work.
+
+`install_client_with_tracer_to` captures bounded startup events for the first
+subscription. Client spans have the same initial buffer. Pre-authentication
+capture is RAM-only until a verified scope claims it; closing/replacing a feed
+does not transfer its records to another owner. Browser staging continues
+independently of a slow HTTP request and retains ownership until actual IDB
+completion. A tab can still disappear before a write commits, and browser site
+data can be evicted or explicitly cleared. Console output, a successful staging
+receipt and a compiled WASM target do not prove remote searchable delivery;
+browser applications own that separate acceptance.
 For the real Android sink check, select an owned running device explicitly:
 `python3 scripts/check-android-sdk.py --serial SERIAL --ndk ANDROID_NDK_PATH`.
 It checks the native SDK process; production Flutter APK acceptance is separate.
