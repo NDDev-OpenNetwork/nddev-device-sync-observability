@@ -5,7 +5,7 @@ fn main() {
     let config = Config {
         service: "sdk-acceptance".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        repository: "NDDev-OpenNetwork/nddev-device-sync-observability".into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability".into(),
         commit: "unknown".into(),
         channel: "alpha".into(),
         standards: "v0.0.1-alpha.9".into(),
