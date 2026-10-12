@@ -27,13 +27,13 @@ jobs:
           python - <<'PYTHON' >> "$GITHUB_OUTPUT"
           import re,tomllib
           value=tomllib.load(open('acceptance-server.lock','rb'))
-          assert value['source_repo']=='NDDev-OpenNetwork/nddev-device-sync-server'
+          assert value['source_repo']=='NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-server'
           assert re.fullmatch('[a-f0-9]{40}',value['source_commit'])
           print('commit='+value['source_commit'])
           PYTHON
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          repository: NDDev-OpenNetwork/nddev-device-sync-server
+          repository: NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-server
           ref: ${{ steps.fixture.outputs.commit }}
           path: .server-acceptance-source
           persist-credentials: false
