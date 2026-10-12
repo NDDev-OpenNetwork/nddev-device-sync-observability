@@ -14,7 +14,8 @@ const CAPACITY: usize = 128;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 const RETENTION: Duration = Duration::from_secs(1800);
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeedHealth {
     pub pending: u32,
     pub dropped: u64,
@@ -37,6 +38,19 @@ struct State {
     closed: bool,
 }
 impl State {
+    fn new() -> Self {
+        Self {
+            items: VecDeque::new(),
+            inflight: 0,
+            dropped: 0,
+            delivered: 0,
+            failures: 0,
+            instance: uuid::Uuid::new_v4().to_string(),
+            sequence: 0,
+            enabled: true,
+            closed: false,
+        }
+    }
     fn discard(&mut self, count: u32) {
         self.dropped = self
             .dropped
@@ -75,7 +89,7 @@ pub struct ExportBatch {
     bytes: Vec<u8>,
     count: u32,
     created: Instant,
-    acknowledged: bool,
+    settled: bool,
 }
 impl ExportBatch {
     pub fn bytes(&self) -> &[u8] {
@@ -91,52 +105,75 @@ impl ExportBatch {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.failures = state.failures.saturating_add(1).min(MAX_COUNTER);
     }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn expires_at_ms(&self) -> Result<u64, Error> {
+        let remaining = RETENTION.checked_sub(self.created.elapsed()).ok_or(Error)?;
+        u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Error)?
+            .checked_add(remaining.as_millis() as u64)
+            .ok_or(Error)
+    }
+    /// Ownership moved to committed browser storage; this is not delivery.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn persisted(mut self) {
+        self.settled = true;
+    }
     pub fn acknowledge(mut self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.delivered = state
             .delivered
             .saturating_add(u64::from(self.count))
             .min(MAX_COUNTER);
-        self.acknowledged = true;
+        self.settled = true;
     }
 }
 impl Drop for ExportBatch {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.inflight -= self.count;
-        if !self.acknowledged {
+        if !self.settled {
             state.discard(self.count);
         }
     }
 }
 
 #[derive(Default)]
-pub(crate) struct Router(Mutex<Weak<Mutex<State>>>);
+struct Route {
+    active: Weak<Mutex<State>>,
+    startup: Option<Arc<Mutex<State>>>,
+}
+#[derive(Default)]
+pub(crate) struct Router(Mutex<Route>);
 impl Router {
+    /// Only client compositions opt in. Claim startup once; events between
+    /// later owners are never carried into the replacement subscription.
+    pub fn buffer_startup(&self) -> Result<(), Error> {
+        let mut slot = self.0.lock().map_err(|_| Error)?;
+        if slot.active.strong_count() != 0 {
+            return Err(Error);
+        }
+        let state = Arc::new(Mutex::new(State::new()));
+        slot.active = Arc::downgrade(&state);
+        slot.startup = Some(state);
+        Ok(())
+    }
     pub fn subscribe(&self) -> Result<ExportFeed, Error> {
         let mut slot = self.0.lock().map_err(|_| Error)?;
-        if let Some(previous) = slot.upgrade()
+        if let Some(startup) = slot.startup.take() {
+            return Ok(ExportFeed(startup));
+        }
+        if let Some(previous) = slot.active.upgrade()
             && !previous.lock().map_err(|_| Error)?.closed
         {
             return Err(Error);
         }
-        let state = Arc::new(Mutex::new(State {
-            items: VecDeque::new(),
-            inflight: 0,
-            dropped: 0,
-            delivered: 0,
-            failures: 0,
-            instance: uuid::Uuid::new_v4().to_string(),
-            sequence: 0,
-            enabled: true,
-            closed: false,
-        }));
-        *slot = Arc::downgrade(&state);
+        let state = Arc::new(Mutex::new(State::new()));
+        slot.active = Arc::downgrade(&state);
         Ok(ExportFeed(state))
     }
     #[cfg(feature = "client-traces")]
     pub fn enqueue_span(&self, bytes: Vec<u8>) {
-        if let Some(queue) = self.0.lock().ok().and_then(|slot| slot.upgrade()) {
+        if let Some(queue) = self.0.lock().ok().and_then(|slot| slot.active.upgrade()) {
             let mut queue = queue.lock().unwrap_or_else(|error| error.into_inner());
             if queue.enabled && !queue.closed {
                 queue.push(bytes);
@@ -144,7 +181,7 @@ impl Router {
         }
     }
     pub fn enqueue(&self, fields: &serde_json::Map<String, serde_json::Value>) {
-        let queue = self.0.lock().ok().and_then(|slot| slot.upgrade());
+        let queue = self.0.lock().ok().and_then(|slot| slot.active.upgrade());
         if let Some(queue) = queue {
             let mut queue = queue.lock().unwrap_or_else(|error| error.into_inner());
             if !queue.enabled || queue.closed {
@@ -195,7 +232,7 @@ impl ExportFeed {
             bytes,
             count,
             created,
-            acknowledged: false,
+            settled: false,
         })
     }
     /// Opt-out discards queued data; the transport still owns its in-flight
@@ -234,6 +271,21 @@ mod tests {
     use super::*;
     fn event(router: &Router) {
         router.enqueue(&serde_json::Map::new());
+    }
+    #[test]
+    fn startup_is_claimed_once_and_cannot_cross_a_replacement_owner() {
+        let router = Router::default();
+        router.buffer_startup().unwrap();
+        event(&router);
+        let first = router.subscribe().unwrap();
+        assert_eq!(first.health().pending, 1);
+        first.take_batch().unwrap().acknowledge();
+        first.close();
+        event(&router);
+        let replacement = router.subscribe().unwrap();
+        assert_eq!(replacement.health().pending, 0);
+        event(&router);
+        assert_eq!(replacement.health().pending, 1);
     }
     #[test]
     fn cancellation_opt_out_and_replacement_account_for_every_admitted_record() {

@@ -756,9 +756,21 @@ pub fn subscriber<W: Write + Send + Sync + 'static>(
     writer: W,
     tracer: Tracer,
 ) -> Result<(impl Subscriber + Send + Sync, Control<W>), Error> {
+    subscriber_configured(config, writer, tracer, false)
+}
+fn subscriber_configured<W: Write + Send + Sync + 'static>(
+    config: Config,
+    writer: W,
+    tracer: Tracer,
+    buffer_startup: bool,
+) -> Result<(impl Subscriber + Send + Sync, Control<W>), Error> {
     let policy = Policy::new(&config)?;
+    let feed = feed::Router::default();
+    if buffer_startup {
+        feed.buffer_startup()?;
+    }
     let shared = Arc::new(Shared {
-        feed: feed::Router::default(),
+        feed,
         policy,
         sink: Mutex::new(Sink {
             writer,
@@ -867,6 +879,24 @@ pub fn install_with_tracer_to(
     tracer: Tracer,
     output: LocalOutput,
 ) -> Result<Logger, Error> {
+    install_configured(config, tracer, output, false)
+}
+/// A bounded startup feed awaits the first authenticated client subscription.
+/// Pre-authentication capture is RAM-only until a verified scope claims it.
+/// Replacing/closing that subscription never rebinds its records to a new owner.
+pub fn install_client_with_tracer_to(
+    config: Config,
+    tracer: Tracer,
+    output: LocalOutput,
+) -> Result<Logger, Error> {
+    install_configured(config, tracer, output, true)
+}
+fn install_configured(
+    config: Config,
+    tracer: Tracer,
+    output: LocalOutput,
+    buffer_startup: bool,
+) -> Result<Logger, Error> {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.set(()).map_err(|_| Error)?;
     // Privacy does not depend on a working OS sink. If initialization fails,
@@ -875,7 +905,7 @@ pub fn install_with_tracer_to(
     std::panic::set_hook(Box::new(|_| {}));
     let (writer, worker) = output::start(output).map_err(|_| Error)?;
     let output = writer.state.clone();
-    let (subscriber, mut control) = subscriber(config, writer, tracer)?;
+    let (subscriber, mut control) = subscriber_configured(config, writer, tracer, buffer_startup)?;
     control.output = Some(output.clone());
     tracing::subscriber::set_global_default(subscriber).map_err(|_| Error)?;
     let panic_control = control.clone();
@@ -1559,3 +1589,7 @@ mod tests {
         assert!(Policy::new(&invalid).is_err());
     }
 }
+
+/// Durable browser transport buffer; callers supply an authenticated scope.
+#[cfg(target_arch = "wasm32")]
+pub mod browser_queue;

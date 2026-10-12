@@ -1253,12 +1253,13 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.6"
+version = "0.0.1-alpha.7"
 dependencies = [
  "android_log-sys",
  "chrono",
  "futures",
  "gloo-timers",
+ "js-sys",
  "jsonschema",
  "opentelemetry",
  "opentelemetry-otlp",
