@@ -13,6 +13,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 pub const MAX_RECEIPTS: i64 = 65_536;
 pub const MAX_QUEUE: i64 = 4_096;
 pub const MAX_QUEUE_BYTES: i64 = 67_108_864;
+pub const REQUIRED_SCHEMA_VERSION: u32 = 2;
 use crate::config::OWN_SERVICE;
 
 #[derive(Clone)]
@@ -111,7 +112,8 @@ impl PgRepository {
 
     pub async fn ready(&self) -> Result<(), Error> {
         let current: bool =
-            sqlx::query_scalar("SELECT value='2' FROM nds_observability_meta WHERE key='schema'")
+            sqlx::query_scalar("SELECT value=$1 FROM nds_observability_meta WHERE key='schema'")
+                .bind(REQUIRED_SCHEMA_VERSION.to_string())
                 .fetch_one(&self.pool)
                 .await
                 .map_err(unavailable)?;

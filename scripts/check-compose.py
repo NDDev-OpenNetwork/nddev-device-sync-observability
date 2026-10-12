@@ -157,6 +157,11 @@ def main():
             obs=endpoint('observability',8080);server=endpoint('server',8080)
             eventually(lambda:request(obs+'/v1/ready')[0]==200)
             eventually(lambda:request(server+'/v1/ready')[0]==200)
+            migration_events=[json.loads(line) for line in compose('logs','--no-log-prefix','--no-color','migrate').stdout.splitlines() if line.startswith('{')]
+            completed=[event for event in migration_events if event.get('event.name')=='migration.completed']
+            assert len(completed)==1, 'one actual migration completion required'
+            assert completed[0]['migration.version']==int(sql('postgres',"SELECT value FROM nds_observability_meta WHERE key='schema'")), 'migration telemetry must identify the actual schema'
+            assert completed[0]['standards.release']==tomllib.loads((ROOT/'standarts.lock').read_text())['source_release'], 'telemetry standards must match the consumed lock'
             if args.fixture_receipt is not None:
                 # These are generated fixture credentials, never operator files.
                 for name in ['ingest_token','admin_token']:
