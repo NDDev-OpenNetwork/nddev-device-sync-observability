@@ -29,7 +29,7 @@ fn actual_native_spans_are_bounded_redacted_and_bound_to_authenticated_source() 
     let config = Config {
         service: "nddev-device-sync-client".into(),
         version: "0.0.1-alpha.1".into(),
-        repository: "NDDev-OpenNetwork/nddev-device-sync-desktop".into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop".into(),
         commit: "unknown".into(),
         channel: "alpha".into(),
         standards: "unreleased".into(),
@@ -77,6 +77,39 @@ fn actual_native_spans_are_bounded_redacted_and_bound_to_authenticated_source() 
             .windows(b"PRIVATE_VALUE".len())
             .any(|part| part == b"PRIVATE_VALUE")
     );
+    // Exercise actual exported OTLP, including retained pre-transfer source IDs.
+    for (repository, accepted) in [
+        (
+            "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop",
+            true,
+        ),
+        (
+            "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-agent",
+            true,
+        ),
+        ("NDDev-OpenNetwork/nddev-device-sync-desktop", true),
+        ("NDDev-OpenNetwork/nddev-device-sync-agent", true),
+        ("untrusted/nddev-device-sync-desktop", false),
+        (
+            "NDDev-Technocracy-OpenNetwork-NDS/unrecognized-producer",
+            false,
+        ),
+    ] {
+        let mut candidate = ExportTraceServiceRequest::decode(batch.bytes()).unwrap();
+        for resource in &mut candidate.resource_spans {
+            for field in &mut resource.resource.as_mut().unwrap().attributes {
+                if field.key == "source.repository" {
+                    field.value.as_mut().unwrap().value =
+                        Some(Value::StringValue(repository.into()));
+                }
+            }
+        }
+        assert_eq!(
+            authenticated_batch(&candidate.encode_to_vec(), source(), now()).is_ok(),
+            accepted,
+            "{repository}"
+        );
+    }
     let (normalized, count) = authenticated_batch(batch.bytes(), source(), now()).unwrap();
     assert_eq!(count, 2);
     let decoded = ExportTraceServiceRequest::decode(normalized.as_slice()).unwrap();

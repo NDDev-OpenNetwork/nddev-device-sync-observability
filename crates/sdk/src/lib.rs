@@ -1126,7 +1126,7 @@ mod tests {
         Config {
             service: "generated-sdk-acceptance".into(),
             version: "0.0.1-alpha.1".into(),
-            repository: "NDDev-OpenNetwork/nddev-device-sync-observability".into(),
+            repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability".into(),
             commit: "unknown".into(),
             channel: "alpha".into(),
             standards: "v0.0.1-alpha.9".into(),
