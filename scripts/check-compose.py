@@ -24,7 +24,7 @@ import uuid
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 SERVER_LOCK=tomllib.loads((ROOT/'acceptance-server.lock').read_text())
-assert SERVER_LOCK['source_repo']=='NDDev-OpenNetwork/nddev-device-sync-server'
+assert SERVER_LOCK['source_repo']=='NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-server'
 SERVER_SOURCE=SERVER_LOCK['source_commit']
 assert re.fullmatch('[a-f0-9]{40}',SERVER_SOURCE)
 SERVER_IMAGE='nds-server-acceptance:'+SERVER_SOURCE[:12]
