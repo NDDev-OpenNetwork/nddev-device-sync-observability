@@ -429,10 +429,10 @@ impl<W: Write> Shared<W> {
         );
         self.write(&mut sink, fields, true);
     }
-    fn reject_fields(&self, count: u64) {
+    fn reject_fields(&self, count: u64, export: bool) {
         if count > 0 {
             self.rejected.fetch_add(count, Ordering::Relaxed);
-            self.emit(
+            self.emit_export(
                 Map::from_iter([
                     ("event.name".into(), "logging.fields.rejected".into()),
                     ("module".into(), "process".into()),
@@ -440,6 +440,7 @@ impl<W: Write> Shared<W> {
                     ("outcome".into(), "rejected".into()),
                 ]),
                 "warn",
+                export,
             );
         }
     }
@@ -611,7 +612,8 @@ where
                 }
             }
         }
-        self.shared.reject_fields(fields.rejected);
+        self.shared
+            .reject_fields(fields.rejected, !fields.export_suppressed);
         self.shared.emit_export(
             fields.values,
             &metadata.level().as_str().to_ascii_lowercase(),
@@ -999,6 +1001,16 @@ pub fn operation_span(module: &str, scope: &str) -> Result<tracing::Span, Error>
     }
     Ok(span)
 }
+/// Finish an operation using the caller's classification of its terminal result.
+/// The core/caller decides whether cancellation, conflict or partial completion
+/// is a failure. This helper never classifies events or accepts error text.
+/// A non-failure leaves status unchanged; it neither claims success nor clears
+/// an error already recorded on the span.
+pub fn finish_operation_span(span: &tracing::Span, terminal_failure: bool) {
+    if terminal_failure {
+        span.set_status(opentelemetry::trace::Status::error(""));
+    }
+}
 /// Instrument the entire delivery operation, including native credential reads.
 /// Descendant events stay local; descendant native spans must not export either.
 /// The marker follows tracing parents across async and blocking workers.
@@ -1120,6 +1132,94 @@ mod tests {
         assert_eq!(feed.health().delivered, u64::from(events));
         drop(feed);
         assert!(control.subscribe().is_ok());
+    }
+
+    #[test]
+    fn delivery_rejections_stay_local_through_async_completion_and_cancellation() {
+        use std::{future::Future, task::Poll};
+        use tracing::Instrument;
+
+        struct Completion;
+        impl Drop for Completion {
+            fn drop(&mut self) {
+                tracing::warn!(
+                    event.name = "delivery.worker.stopped",
+                    private_detail = "PRIVATE_DELIVERY_DETAIL",
+                    outcome = "stopped"
+                );
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder().build();
+        let (subscriber, control) = subscriber(
+            config(),
+            Capture(output.clone()),
+            provider.tracer("delivery-rejection"),
+        )
+        .unwrap();
+        let feed = control.subscribe().unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            for cancel in [false, true] {
+                let delivery = delivery_span();
+                let child = delivery.in_scope(|| operation_span("accounts", "io").unwrap());
+                let future = async {
+                    let _completion = Completion;
+                    let mut suspended = false;
+                    std::future::poll_fn(move |_| {
+                        if suspended {
+                            Poll::Ready(())
+                        } else {
+                            suspended = true;
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    tracing::warn!(
+                        event.name = "delivery.worker.completed",
+                        private_detail = "PRIVATE_DELIVERY_DETAIL",
+                        outcome = "ok"
+                    );
+                }
+                .instrument(child);
+                // The waiting parent can end before its detached I/O worker.
+                drop(delivery);
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                std::thread::spawn(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        let mut future = Box::pin(future);
+                        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                        assert!(future.as_mut().poll(&mut context).is_pending());
+                        if !cancel {
+                            assert!(future.as_mut().poll(&mut context).is_ready());
+                        }
+                        drop(future);
+                    });
+                })
+                .join()
+                .unwrap();
+            }
+            assert_eq!(feed.health().pending, 0);
+            assert_eq!(control.rejected_fields_or_events(), 3);
+            // Rejection outside delivery still reports to the export feed.
+            tracing::warn!(
+                event.name = "module.query.completed",
+                private_detail = "PRIVATE_DELIVERY_DETAIL",
+                outcome = "ok"
+            );
+        });
+        let batch = feed.take_batch().unwrap();
+        assert_eq!(batch.count(), 2);
+        let exported = std::str::from_utf8(batch.bytes()).unwrap();
+        assert!(exported.contains("logging.fields.rejected"));
+        assert!(exported.contains("module.query.completed"));
+        assert!(!exported.contains("delivery.worker") && !exported.contains("PRIVATE_DELIVERY"));
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("logging.fields.rejected").count(), 4);
+        assert_eq!(output.matches("delivery.worker.stopped").count(), 2);
+        assert!(
+            output.contains("delivery.worker.completed") && !output.contains("PRIVATE_DELIVERY")
+        );
+        assert_eq!(control.rejected_fields_or_events(), 4);
     }
 
     fn config() -> Config {
