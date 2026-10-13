@@ -14,7 +14,7 @@ const CAPACITY: usize = 128;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 const RETENTION: Duration = Duration::from_secs(1800);
 
-#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeedHealth {
     pub pending: u32,

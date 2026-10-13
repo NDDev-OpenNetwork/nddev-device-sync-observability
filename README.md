@@ -84,6 +84,10 @@ request to settle. A browser-owned sender lock serializes tabs and is released
 between retries. Unknown outcomes may repeat spans with their original IDs;
 this is not an exactly-once delivery claim. Opt-out discards the scoped queue.
 Counters distinguish queued, durably acknowledged, discarded and failed work.
+The SDK owns durable-spool admission, expiry and receipt accounting in Rust.
+Its synchronous policy callback returns mutations inside the strict IndexedDB
+transaction; JavaScript owns storage/lock I/O only. Detached operation ownership
+keeps the callback alive through commit or abort after caller cancellation.
 
 `install_client_with_tracer_to` captures bounded startup events for the first
 subscription. Client spans have the same initial buffer. Pre-authentication

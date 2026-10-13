@@ -33,6 +33,8 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser_queue_policy;
 #[cfg(feature = "client-traces")]
 pub mod client_traces;
 mod feed;
