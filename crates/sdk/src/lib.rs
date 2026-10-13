@@ -1001,6 +1001,16 @@ pub fn operation_span(module: &str, scope: &str) -> Result<tracing::Span, Error>
     }
     Ok(span)
 }
+/// Finish an operation using the caller's classification of its terminal result.
+/// The core/caller decides whether cancellation, conflict or partial completion
+/// is a failure. This helper never classifies events or accepts error text.
+/// A non-failure leaves status unchanged; it neither claims success nor clears
+/// an error already recorded on the span.
+pub fn finish_operation_span(span: &tracing::Span, terminal_failure: bool) {
+    if terminal_failure {
+        span.set_status(opentelemetry::trace::Status::error(""));
+    }
+}
 /// Instrument the entire delivery operation, including native credential reads.
 /// Descendant events stay local; descendant native spans must not export either.
 /// The marker follows tracing parents across async and blocking workers.
