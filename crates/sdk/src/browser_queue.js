@@ -55,7 +55,7 @@ export async function queueOperation(encoded,input,policy) {
     const [values,count,expired,rows,lookup]=await Promise.all([
       request(health.getAll(undefined,read.health_limit)),request(records.count()),
       request(records.index('expiry').getAll(IDBKeyRange.upperBound(now),read.row_limit)),
-      read.scan?request(read.ordered?records.index('scope_expiry').getAll(IDBKeyRange.bound([read.scope,0],[read.scope,read.counter_limit]),read.row_limit):records.index('scope').getAll(read.scope,read.row_limit)):[],
+      read.scan?request(read.ordered?records.index('scope_expiry').getAll(IDBKeyRange.bound([read.scope,now],[read.scope,read.counter_limit],true,false),1):records.index('scope').getAll(read.scope,read.row_limit)):[],
       read.lookup?request(records.get(read.lookup)):null,
     ]);
     const loaded=new Map([...expired,...rows,...(lookup?[lookup]:[])].map(row=>[row.id,row]));

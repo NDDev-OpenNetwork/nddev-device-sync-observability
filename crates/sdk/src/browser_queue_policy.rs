@@ -246,6 +246,12 @@ fn remove(
     Ok(())
 }
 
+// Same ordering as scope_expiry: expiry, then the object store's primary ID.
+fn order(left: &Record, right: &Record) -> std::cmp::Ordering {
+    (left.metadata.expires_at_ms, &left.metadata.id)
+        .cmp(&(right.metadata.expires_at_ms, &right.metadata.id))
+}
+
 pub(crate) fn decide(
     scope: &str,
     command: &Command,
@@ -324,6 +330,7 @@ pub(crate) fn decide(
     let mut put = Vec::new();
     let mut append = None;
     let mut next = None;
+    let mut protected: Option<Record> = None;
     for record in snapshot.expired {
         if record
             .inflight_until
@@ -338,6 +345,13 @@ pub(crate) fn decide(
             )?;
             deleted.insert(record.metadata.id);
             global_changed = true;
+        } else if matches!(command, Command::Next(_))
+            && record.scope == scope
+            && protected
+                .as_ref()
+                .is_none_or(|previous| order(&record, previous).is_lt())
+        {
+            protected = Some(record);
         }
     }
     match command {
@@ -406,10 +420,11 @@ pub(crate) fn decide(
         }
         Command::Next(_) => {
             if scopes.get(scope).ok_or(Error)?.enabled
-                && let Some(mut record) = snapshot
-                    .records
+                && let Some(mut record) = protected
                     .into_iter()
-                    .find(|record| !deleted.contains(&record.metadata.id))
+                    .chain(snapshot.records)
+                    .filter(|record| !deleted.contains(&record.metadata.id))
+                    .min_by(order)
             {
                 record.metadata.validate()?;
                 if record.scope != scope
@@ -561,7 +576,7 @@ mod tests {
         entry.metadata.expires_at_ms = 900;
         entry.inflight_until = Some(2000);
         before.expired = vec![entry.clone()];
-        before.records = vec![entry.clone()];
+        before.records = vec![];
         let done = decide(&scope(), &Command::Next(sender()), 0, before).unwrap();
         assert_eq!(done.result.events.pending, 2);
         assert!(done.remove.is_empty());
@@ -569,6 +584,39 @@ mod tests {
         assert_eq!(next.id, entry.metadata.id);
         assert_eq!(next.expires_at_ms, 900);
         assert_eq!(done.put[0].size, 4);
+    }
+    #[test]
+    fn protected_expired_candidate_precedes_live_candidate_after_cleanup() {
+        let mut gone = record();
+        gone.metadata.expires_at_ms = 800;
+        let mut held = record();
+        held.metadata.id = "00000000-0000-4000-8000-000000000002".into();
+        held.metadata.expires_at_ms = 900;
+        held.inflight_until = Some(2000);
+        let mut live = record();
+        live.metadata.id = "00000000-0000-4000-8000-000000000003".into();
+        for grace in [Some(2000), Some(1000)] {
+            let mut before = snapshot(6);
+            before.record_count = 3;
+            before.health[0]["bytes"] = 12.into();
+            before.health[0]["batches"] = 3.into();
+            held.inflight_until = grace;
+            before.expired = vec![gone.clone(), held.clone()];
+            before.records = vec![live.clone()];
+            let done = decide(&scope(), &Command::Next(sender()), 0, before).unwrap();
+            let (selected, dropped) = if grace == Some(2000) {
+                (&held, 2)
+            } else {
+                (&live, 4)
+            };
+            assert_eq!(done.next.unwrap().id, selected.metadata.id);
+            assert_eq!(
+                done.put[0].metadata.expires_at_ms,
+                selected.metadata.expires_at_ms
+            );
+            assert_eq!(done.result.events.dropped, dropped);
+            assert_eq!(done.result.events.pending, 6 - dropped as u32);
+        }
     }
     #[test]
     fn corruption_scope_loss_and_counter_exhaustion_do_not_produce_a_mutation_plan() {
