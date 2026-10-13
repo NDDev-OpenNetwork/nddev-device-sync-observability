@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-observability"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "axum",
  "chrono",

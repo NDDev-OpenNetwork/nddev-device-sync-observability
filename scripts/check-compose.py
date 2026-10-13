@@ -248,6 +248,41 @@ def main():
             assert sql('postgres',"SELECT count(*) FROM client_producers WHERE service_name='"+device_source+"'")== '1'
             print('Actual SDK client stream: device-scoped incident, producer replay/sequence and optional liveness passed')
 
+            # Offline expiry-prioritized batches can deliver a later producer
+            # record first. Preserve both actual SDK records without rewinding
+            # source progress, hiding late failures or weakening replay.
+            late_device=str(uuid.uuid4())
+            late_instance=str(uuid.uuid4())
+            late_source='nddev-device-sync-client.'+hashlib.sha256(late_device.encode()).hexdigest()[:24]
+            late_cycle=[event | {'service.name':'nddev-device-sync-client','device.id':late_device,'producer.instance_id':late_instance} for event in cycle]
+            earlier=next(event for event in late_cycle if event['event.name']=='client.failure')
+            later=next(event for event in late_cycle if event['event.name']=='client.ready')
+            assert earlier['producer.sequence']<later['producer.sequence']
+            assert ingest([later])['accepted']==1
+            freshness=sql('postgres',"SELECT last_event_at::text FROM sources WHERE service_name='"+late_source+"'")
+            assert ingest([earlier])['accepted']==1
+            delayed_incident=eventually(lambda:next((row for row in incidents() if row['service_name']==late_source and row['kind']=='process' and row['state']=='open'),None))
+            assert delayed_incident['occurrences']==1
+            assert ingest([earlier])['duplicates']==1
+            assert next(row for row in incidents() if row['incident_id']==delayed_incident['incident_id'])['occurrences']==1
+            assert sql('postgres',"SELECT last_sequence FROM client_producers WHERE instance_id='"+late_instance+"'::uuid")==str(later['producer.sequence'])
+            assert sql('postgres',"SELECT last_event_at::text FROM sources WHERE service_name='"+late_source+"'")==freshness
+            indexed=eventually(lambda:found if len(found:=search('nds','logs',"device_id='"+late_device+"'"))==2 else None)
+            assert {row.get('event_name',row.get('event.name')) for row in indexed}=={'client.failure','client.ready'}
+            # Rebinding is still rejected transactionally, including its source
+            # row and the fingerprint inserted before producer validation.
+            rebound=later | {'service.name':'nddev-device-sync-agent','producer.sequence':later['producer.sequence']+1}
+            code,_=request(obs+'/v2/observability/events',json.dumps(rebound)+'\n',token=values['ingest_token'],headers={'Content-Type':'application/x-ndjson'})
+            assert code==400
+            assert sql('postgres',"SELECT count(*) FROM sources WHERE service_name='nddev-device-sync-agent."+hashlib.sha256(late_device.encode()).hexdigest()[:24]+"'")=='0'
+            assert sql('postgres',"SELECT last_sequence FROM client_producers WHERE instance_id='"+late_instance+"'::uuid")==str(later['producer.sequence'])
+            recovered=command(ROOT/'target/debug/examples/sdk_probe','--client-cycle',timeout=5)
+            recovery=next(event for line in recovered.stdout.splitlines() if (event:=json.loads(line))['event.name']=='client.ready')
+            recovery=recovery | {'service.name':'nddev-device-sync-client','device.id':late_device,'producer.instance_id':str(uuid.uuid5(uuid.NAMESPACE_OID,recovery['producer.instance_id']+late_device))}
+            assert ingest([recovery])['accepted']==1
+            eventually(lambda:any(row['incident_id']==delayed_incident['incident_id'] and row['state']=='resolved' for row in incidents()))
+            print('Delayed SDK records indexed once; high-water/freshness retained; late failure observed and later recovery resolved it; rebinding rejected')
+
             if client_events:
                 for start in range(0,len(client_events),100):ingest(client_events[start:start+100])
                 for kind in ['flutter_framework_error','dart_unhandled_error']:

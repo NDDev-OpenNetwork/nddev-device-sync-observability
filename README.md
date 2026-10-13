@@ -30,6 +30,13 @@ not the business sync operation log. Incident action receipts also retain one
 hour; timestamped operation IDs and a persisted monotonic observed-time floor
 prevent an expired operation from becoming new again after clock rollback.
 
+Client batches may arrive out of producer order. Unique delayed records remain
+searchable and repeated records use the same fingerprint receipts.
+Retained producer progress and source freshness never move backwards. Newly
+observed failures enter the ordinary incident lifecycle; duplicate receipts do
+not reapply transitions. An existing producer cannot be rebound to a different
+device or service.
+
 Clients can subscribe to SDK-owned event and actual OTLP span feeds.
 Each feed bounds queued plus in-flight records to 128, batches to 32 records /
 64 KiB and retention to 30 minutes. Batch ownership accounts for cancellation,
