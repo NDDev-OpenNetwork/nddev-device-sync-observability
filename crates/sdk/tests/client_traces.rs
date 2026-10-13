@@ -2,7 +2,7 @@
 use nddev_device_sync_telemetry::{
     Config,
     client_traces::{AuthenticatedSource, ClientTraces, authenticated_batch},
-    delivery_span, operation_span, subscriber,
+    delivery_span, finish_operation_span, operation_span, subscriber,
 };
 use opentelemetry_proto::tonic::{
     collector::trace::v1::ExportTraceServiceRequest,
@@ -24,9 +24,8 @@ fn now() -> u64 {
         .unwrap()
         .as_nanos() as u64
 }
-#[test]
-fn actual_native_spans_are_bounded_redacted_and_bound_to_authenticated_source() {
-    let config = Config {
+fn config() -> Config {
+    Config {
         service: "nddev-device-sync-client".into(),
         version: "0.0.1-alpha.1".into(),
         repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop".into(),
@@ -37,7 +36,11 @@ fn actual_native_spans_are_bounded_redacted_and_bound_to_authenticated_source() 
         target_prefixes: vec!["nds_acceptance".into()],
         default_module: "process".into(),
         debug: None,
-    };
+    }
+}
+#[test]
+fn actual_native_spans_are_bounded_redacted_and_bound_to_authenticated_source() {
+    let config = config();
     let traces = ClientTraces::new(&config).unwrap();
     let feed = traces.subscribe().unwrap();
     let (subscriber, _) = subscriber(config, std::io::sink(), traces.tracer()).unwrap();
@@ -148,4 +151,62 @@ fn actual_native_spans_are_bounded_redacted_and_bound_to_authenticated_source() 
     batch.acknowledge();
     assert_eq!(feed.health().delivered, 2);
     assert_eq!(feed.health().pending, 0);
+}
+
+#[test]
+fn caller_classified_failure_survives_authenticated_otlp_without_new_fields() {
+    let config = config();
+    let traces = ClientTraces::new(&config).unwrap();
+    let feed = traces.subscribe().unwrap();
+    let (subscriber, _) = subscriber(config, std::io::sink(), traces.tracer()).unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        let failed = operation_span("rds", "io").unwrap();
+        // Failure is explicit even when there was no warning/error event.
+        finish_operation_span(&failed, true);
+        drop(failed);
+
+        let handled = operation_span("gds", "io").unwrap();
+        handled.in_scope(|| {
+            tracing::event!(target:"nds_acceptance",tracing::Level::WARN, {
+                event.name="module.query.checked",outcome="checked"
+            });
+        });
+        // A warning does not determine the operation's terminal result.
+        finish_operation_span(&handled, false);
+        drop(handled);
+
+        let retained = operation_span("accounts", "io").unwrap();
+        finish_operation_span(&retained, true);
+        finish_operation_span(&retained, false);
+        drop(retained);
+
+        delivery_span().in_scope(|| {
+            let local = operation_span("accounts", "io").unwrap();
+            finish_operation_span(&local, true);
+        });
+    });
+    let batch = feed.take_batch().unwrap();
+    assert_eq!(batch.count(), 3);
+    let (normalized, count) = authenticated_batch(batch.bytes(), source(), now()).unwrap();
+    assert_eq!(count, 3);
+    let decoded = ExportTraceServiceRequest::decode(normalized.as_slice()).unwrap();
+    let spans: Vec<_> = decoded
+        .resource_spans
+        .iter()
+        .flat_map(|resource| &resource.scope_spans)
+        .flat_map(|scope| &scope.spans)
+        .collect();
+    let statuses: Vec<_> = spans
+        .iter()
+        .map(|span| span.status.as_ref().unwrap().code)
+        .collect();
+    assert_eq!(statuses, [2, 0, 2]);
+    assert!(spans.iter().all(|span| {
+        span.status.as_ref().unwrap().message.is_empty()
+            && span.events.is_empty()
+            && span
+                .attributes
+                .iter()
+                .all(|field| matches!(field.key.as_str(), "module" | "scope"))
+    }));
 }
