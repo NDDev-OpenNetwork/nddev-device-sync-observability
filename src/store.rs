@@ -378,7 +378,7 @@ impl Repository for PgRepository {
                 let previous:Option<(String,i64)>=sqlx::query_as("SELECT service_name,last_sequence FROM client_producers WHERE tenant_id=$1 AND instance_id=$2::uuid FOR UPDATE").bind(&*self.tenant).bind(instance).fetch_optional(&mut *tx).await.map_err(unavailable)?;
                 if previous
                     .as_ref()
-                    .is_some_and(|(stored, last)| stored != &service || sequence <= *last)
+                    .is_some_and(|(stored, _)| stored != &service)
                 {
                     return Err(Error::Invalid);
                 }
@@ -394,9 +394,13 @@ impl Repository for PgRepository {
                         return Err(Error::Capacity);
                     }
                 }
-                let gap = previous.is_some_and(|(_, last)| sequence != last.saturating_add(1));
-                sqlx::query("INSERT INTO client_producers(tenant_id,instance_id,service_name,last_sequence,last_received_at) VALUES($1,$2::uuid,$3,$4,$5) ON CONFLICT(tenant_id,instance_id) DO UPDATE SET last_sequence=EXCLUDED.last_sequence,last_received_at=EXCLUDED.last_received_at").bind(&*self.tenant).bind(instance).bind(&service).bind(sequence).bind(now).execute(&mut *tx).await.map_err(unavailable)?;
-                sqlx::query("UPDATE sources SET last_received_at=$3,last_event_at=$4,gap_observations=LEAST(gap_observations+$5,9007199254740991),gap_active=$6 WHERE tenant_id=$1 AND service_name=$2").bind(&*self.tenant).bind(&service).bind(now).bind(instant(event.timestamp_ms)?).bind(if gap{1_i64}else{0_i64}).bind(gap).execute(&mut *tx).await.map_err(unavailable)?;
+                // Offline batches and retries can arrive out of producer order.
+                // Fingerprint receipts deduplicate records; the sequence is a
+                // high-water mark, not an admission rule for historical logs.
+                let advances = previous.as_ref().is_none_or(|(_, last)| sequence > *last);
+                let gap = previous.is_some_and(|(_, last)| sequence > last.saturating_add(1));
+                sqlx::query("INSERT INTO client_producers(tenant_id,instance_id,service_name,last_sequence,last_received_at) VALUES($1,$2::uuid,$3,$4,$5) ON CONFLICT(tenant_id,instance_id) DO UPDATE SET last_sequence=GREATEST(client_producers.last_sequence,EXCLUDED.last_sequence),last_received_at=EXCLUDED.last_received_at").bind(&*self.tenant).bind(instance).bind(&service).bind(sequence).bind(now).execute(&mut *tx).await.map_err(unavailable)?;
+                sqlx::query("UPDATE sources SET last_received_at=$3,last_event_at=GREATEST(last_event_at,$4),gap_observations=LEAST(gap_observations+$5,9007199254740991),gap_active=CASE WHEN $7 THEN $6 ELSE gap_active END WHERE tenant_id=$1 AND service_name=$2").bind(&*self.tenant).bind(&service).bind(now).bind(instant(event.timestamp_ms)?).bind(if gap{1_i64}else{0_i64}).bind(gap).bind(advances).execute(&mut *tx).await.map_err(unavailable)?;
                 (service, gap)
             } else {
                 let source=sqlx::query("SELECT instance_id::text,last_sequence FROM sources WHERE tenant_id=$1 AND service_name=$2 FOR UPDATE").bind(&*self.tenant).bind(&event.service).fetch_one(&mut *tx).await.map_err(unavailable)?;
