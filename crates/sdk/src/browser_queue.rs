@@ -1,35 +1,19 @@
-//! Authenticated export spool. Records already passed the canonical redaction
-//! boundary; IndexedDB stores exact event/OTLP batches and their receipt state.
-//! Closing a realm cannot promise to persist events that have not committed.
-use crate::{Error, ExportBatch, FeedHealth};
-use serde::{Deserialize, Serialize};
+//! Authenticated export spool. Rust owns policy; the browser owns the strict
+//! transaction, opaque byte storage and physical sender lock. Cancelled callers
+//! cannot drop a callback while its IndexedDB operation is still using it.
+use crate::{Error, ExportBatch, FeedHealth, browser_queue_policy as policy};
+use policy::{Command, Disposition, Metadata, decide};
+pub use policy::{Health, Signal};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    rc::Rc,
+    time::Duration,
+};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
+use web_time::Instant;
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Signal {
-    Events,
-    Traces,
-}
-#[derive(Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Health {
-    pub events: FeedHealth,
-    pub traces: FeedHealth,
-    pub enabled: bool,
-    pub last_success_at: u64,
-    pub revision: u64,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Metadata {
-    id: String,
-    signal: Signal,
-    count: u32,
-    expires_at_ms: u64,
-    attempts: u8,
-}
 pub struct Batch {
     metadata: Metadata,
     bytes: Vec<u8>,
@@ -55,15 +39,65 @@ impl Batch {
 extern "C" {
     #[wasm_bindgen(catch,js_name=queueOperation)]
     fn operation(
-        scope: &str,
-        command: &str,
-        metadata: &str,
+        reads: &str,
         bytes: &[u8],
+        policy: &js_sys::Function,
     ) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(catch,js_name=acquireSender)]
-    fn acquire(scope: &str, id: &str) -> Result<js_sys::Promise, JsValue>;
+    fn acquire(scope: &str, id: &str, timeout: u32) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(js_name=releaseSender)]
     fn release(id: &str);
+}
+thread_local! {
+    static OPERATIONS:Cell<u8>=const{Cell::new(0)};
+    static SENDERS:RefCell<BTreeMap<String,Instant>>=const{RefCell::new(BTreeMap::new())};
+}
+struct Operation;
+impl Operation {
+    fn admit() -> Result<Self, Error> {
+        OPERATIONS.with(|count| {
+            if count.get() >= policy::MAX_OPERATIONS {
+                Err(Error)
+            } else {
+                count.set(count.get() + 1);
+                Ok(Self)
+            }
+        })
+    }
+}
+impl Drop for Operation {
+    fn drop(&mut self) {
+        OPERATIONS.with(|count| count.set(count.get() - 1));
+    }
+}
+struct Lease {
+    id: String,
+    scope: String,
+}
+impl Lease {
+    fn new(scope: String) -> Result<Rc<Self>, Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        SENDERS.with(|senders| {
+            let mut senders = senders.borrow_mut();
+            senders.retain(|_, created| {
+                created.elapsed() < Duration::from_millis(u64::from(policy::SENDER_MS))
+            });
+            if senders.len() >= policy::MAX_SCOPES {
+                return Err(Error);
+            }
+            senders.insert(id.clone(), Instant::now());
+            Ok(())
+        })?;
+        Ok(Rc::new(Self { id, scope }))
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        release(&self.id);
+        SENDERS.with(|senders| {
+            senders.borrow_mut().remove(&self.id);
+        });
+    }
 }
 #[derive(Clone)]
 pub struct Queue {
@@ -71,48 +105,71 @@ pub struct Queue {
 }
 impl Queue {
     pub fn new(scope: String) -> Result<Self, Error> {
-        if scope.len() != 64
-            || !scope
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !policy::valid_scope(&scope) {
             return Err(Error);
         }
         Ok(Self { scope })
     }
-    async fn call(&self, command: &str, metadata: &str, bytes: &[u8]) -> Result<JsValue, Error> {
-        JsFuture::from(operation(&self.scope, command, metadata, bytes).map_err(|_| Error)?)
-            .await
-            .map_err(|_| Error)
+    async fn call(
+        &self,
+        command: Command,
+        bytes: &[u8],
+        lease: Option<Rc<Lease>>,
+    ) -> Result<JsValue, Error> {
+        let reads =
+            serde_json::to_string(&command.reads(&self.scope, bytes.len())?).map_err(|_| Error)?;
+        let permit = Operation::admit()?;
+        let scope = self.scope.clone();
+        let bytes = bytes.to_vec();
+        let size = bytes.len();
+        let (send, receive) = futures::channel::oneshot::channel();
+        wasm_bindgen_futures::spawn_local(async move {
+            let callback = Closure::<dyn FnMut(String) -> Result<String, JsValue>>::new(
+                move |snapshot: String| {
+                    let result = (|| {
+                        if snapshot.len() > 8 * 1024 * 1024 {
+                            return Err(Error);
+                        }
+                        let snapshot = serde_json::from_str(&snapshot).map_err(|_| Error)?;
+                        serde_json::to_string(&decide(&scope, &command, size, snapshot)?)
+                            .map_err(|_| Error)
+                    })();
+                    result.map_err(|_| js_sys::Error::new("telemetry_store_unavailable").into())
+                },
+            );
+            // Neither callback nor admission is tied to the caller's future.
+            // The adapter resolves only after commit/abort and has no later call.
+            let result = match operation(&reads, &bytes, callback.as_ref().unchecked_ref()) {
+                Ok(promise) => JsFuture::from(promise).await.map_err(|_| Error),
+                Err(_) => Err(Error),
+            };
+            drop(callback);
+            drop(lease);
+            drop(permit);
+            let _ = send.send(result);
+        });
+        receive.await.map_err(|_| Error)?
     }
     fn health_result(value: JsValue) -> Result<Health, Error> {
         let text = value.as_string().filter(|v| v.len() <= 4096).ok_or(Error)?;
         serde_json::from_str(&text).map_err(|_| Error)
     }
     pub async fn health(&self) -> Result<Health, Error> {
-        Self::health_result(self.call("health", "", &[]).await?)
+        Self::health_result(self.call(Command::Health, &[], None).await?)
     }
     pub async fn record_losses(
         &self,
         events: FeedHealth,
         traces: FeedHealth,
     ) -> Result<Health, Error> {
-        let encoded = serde_json::to_string(&serde_json::json!({
-            "events": {"dropped":events.dropped,"failures":events.failures},
-            "traces": {"dropped":traces.dropped,"failures":traces.failures}
-        }))
-        .map_err(|_| Error)?;
-        Self::health_result(self.call("losses", &encoded, &[]).await?)
-    }
-    pub async fn set_enabled(&self, enabled: bool) -> Result<Health, Error> {
         Self::health_result(
-            self.call(if enabled { "enable" } else { "disable" }, "", &[])
+            self.call(Command::Losses { events, traces }, &[], None)
                 .await?,
         )
     }
-    /// The spawned writer retains ownership through actual IDB completion even
-    /// when its caller is cancelled. On an unknown/failed write the RAM feed
-    /// reports loss; committed batches remain available for exact-ID replay.
+    pub async fn set_enabled(&self, enabled: bool) -> Result<Health, Error> {
+        Self::health_result(self.call(Command::Enabled(enabled), &[], None).await?)
+    }
     pub async fn persist(&self, signal: Signal, batch: ExportBatch) -> Result<Health, Error> {
         let metadata = Metadata {
             id: uuid::Uuid::new_v4().to_string(),
@@ -121,12 +178,11 @@ impl Queue {
             expires_at_ms: batch.expires_at_ms()?,
             attempts: 0,
         };
-        let encoded = serde_json::to_string(&metadata).map_err(|_| Error)?;
         let queue = self.clone();
         let (send, receive) = futures::channel::oneshot::channel();
         wasm_bindgen_futures::spawn_local(async move {
             let result = queue
-                .call("append", &encoded, batch.bytes())
+                .call(Command::Append(metadata), batch.bytes(), None)
                 .await
                 .and_then(Self::health_result);
             if result.is_ok() {
@@ -138,38 +194,40 @@ impl Queue {
         });
         receive.await.map_err(|_| Error)?
     }
-    /// Browser-owned Web Lock: closing a tab releases it, without a stale
-    /// persistent claim. Transport retries may repeat already accepted spans.
     pub async fn sender(&self) -> Result<Option<Sender>, Error> {
-        let sender = Sender {
-            id: uuid::Uuid::new_v4().to_string(),
-            scope: self.scope.clone(),
-        };
-        let acquired = JsFuture::from(acquire(&self.scope, &sender.id).map_err(|_| Error)?)
-            .await
-            .map_err(|_| Error)?
-            .as_bool()
-            .ok_or(Error)?;
-        Ok(acquired.then_some(sender))
+        let lease = Lease::new(self.scope.clone())?;
+        let (send, receive) = futures::channel::oneshot::channel();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = match acquire(&lease.scope, &lease.id, policy::SENDER_MS) {
+                Ok(promise) => JsFuture::from(promise)
+                    .await
+                    .map_err(|_| Error)
+                    .and_then(|value| value.as_bool().ok_or(Error)),
+                Err(_) => Err(Error),
+            }
+            .map(|acquired| acquired.then_some(Sender { lease }));
+            let _ = send.send(result);
+        });
+        receive.await.map_err(|_| Error)?
     }
 }
 pub struct Sender {
-    id: String,
-    scope: String,
-}
-impl Drop for Sender {
-    fn drop(&mut self) {
-        release(&self.id);
-    }
+    lease: Rc<Lease>,
 }
 impl Sender {
-    pub async fn next(&self) -> Result<Option<Batch>, Error> {
-        let value = Queue {
-            scope: self.scope.clone(),
+    async fn call(&self, command: Command) -> Result<JsValue, Error> {
+        Queue {
+            scope: self.lease.scope.clone(),
         }
-        .call("next", &self.id, &[])
-        .await?;
-        if value.is_null() {
+        .call(command, &[], Some(self.lease.clone()))
+        .await
+    }
+    pub async fn next(&self) -> Result<Option<Batch>, Error> {
+        let value = self.call(Command::Next(self.lease.id.clone())).await?;
+        // A health result means no eligible record; the adapter returns opaque
+        // bytes only for the exact record the Rust plan selected.
+        if value.is_string() {
+            Queue::health_result(value)?;
             return Ok(None);
         }
         let parts = value.dyn_into::<js_sys::Array>().map_err(|_| Error)?;
@@ -184,41 +242,37 @@ impl Sender {
                 .ok_or(Error)?,
         )
         .map_err(|_| Error)?;
+        metadata.validate()?;
         let bytes = parts
             .get(1)
             .dyn_into::<js_sys::Uint8Array>()
             .map_err(|_| Error)?
             .to_vec();
-        if bytes.is_empty()
-            || bytes.len() > 65536
-            || metadata.count == 0
-            || metadata.count > 32
-            || metadata.attempts > 8
-            || uuid::Uuid::parse_str(&metadata.id).is_err()
-        {
+        if bytes.is_empty() || bytes.len() > policy::MAX_BATCH_BYTES {
             return Err(Error);
         }
         Ok(Some(Batch { metadata, bytes }))
     }
     pub async fn acknowledge(&self, batch: &Batch) -> Result<Health, Error> {
-        self.finish("acknowledge", batch).await
+        self.finish(Disposition::Delivered, batch).await
     }
     pub async fn failed(&self, batch: &Batch) -> Result<Health, Error> {
-        self.finish("failed", batch).await
+        self.finish(Disposition::Failed, batch).await
     }
     pub async fn discard(&self, batch: &Batch) -> Result<Health, Error> {
-        self.finish("discard", batch).await
+        self.finish(Disposition::Dropped, batch).await
     }
-    async fn finish(&self, command: &str, batch: &Batch) -> Result<Health, Error> {
-        let metadata =
-            serde_json::to_string(&serde_json::json!({"sender":self.id,"batch":batch.metadata.id}))
-                .map_err(|_| Error)?;
-        Queue::health_result(
-            Queue {
-                scope: self.scope.clone(),
-            }
-            .call(command, &metadata, &[])
+    async fn finish(&self, disposition: Disposition, batch: &Batch) -> Result<Health, Error> {
+        Self::health(
+            self.call(Command::Finish {
+                sender: self.lease.id.clone(),
+                batch: batch.metadata.id.clone(),
+                disposition,
+            })
             .await?,
         )
+    }
+    fn health(value: JsValue) -> Result<Health, Error> {
+        Queue::health_result(value)
     }
 }
