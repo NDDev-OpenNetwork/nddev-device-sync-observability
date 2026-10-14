@@ -45,6 +45,8 @@ extern "C" {
     ) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(catch,js_name=acquireSender)]
     fn acquire(scope: &str, id: &str, timeout: u32) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(js_name=renewSender)]
+    fn renew(scope: &str, id: &str, timeout: u32) -> bool;
     #[wasm_bindgen(js_name=releaseSender)]
     fn release(id: &str);
 }
@@ -79,16 +81,37 @@ impl Lease {
         let id = uuid::Uuid::new_v4().to_string();
         SENDERS.with(|senders| {
             let mut senders = senders.borrow_mut();
-            senders.retain(|_, created| {
-                created.elapsed() < Duration::from_millis(u64::from(policy::SENDER_MS))
-            });
+            let now = Instant::now();
+            senders.retain(|_, deadline| *deadline > now);
             if senders.len() >= policy::MAX_SCOPES {
                 return Err(Error);
             }
-            senders.insert(id.clone(), Instant::now());
+            senders.insert(
+                id.clone(),
+                now + Duration::from_millis(u64::from(policy::SENDER_MS)),
+            );
             Ok(())
         })?;
         Ok(Rc::new(Self { id, scope }))
+    }
+    fn renew(&self, timeout: u32) -> Result<(), Error> {
+        SENDERS.with(|senders| {
+            let mut senders = senders.borrow_mut();
+            let deadline = senders.get_mut(&self.id).ok_or(Error)?;
+            let now = Instant::now();
+            if *deadline <= now {
+                return Err(Error);
+            }
+            let extended = (*deadline).max(now + Duration::from_millis(u64::from(timeout)));
+            let timeout =
+                u32::try_from(extended.duration_since(now).as_nanos().div_ceil(1_000_000))
+                    .map_err(|_| Error)?;
+            if !renew(&self.scope, &self.id, timeout) {
+                return Err(Error);
+            }
+            *deadline = extended;
+            Ok(())
+        })
     }
 }
 impl Drop for Lease {
@@ -255,6 +278,31 @@ impl Sender {
     }
     pub async fn acknowledge(&self, batch: &Batch) -> Result<Health, Error> {
         self.finish(Disposition::Delivered, batch).await
+    }
+    /// Partial transport acceptance removes the opaque batch once and reports
+    /// rejected records as dropped, without asserting full-success freshness.
+    pub async fn acknowledge_count(&self, batch: &Batch, accepted: i64) -> Result<Health, Error> {
+        crate::feed::settlement(batch.count(), accepted)?;
+        // Only a known, valid receipt may extend current ownership. Never
+        // shorten its granted tail or start an extension after batch expiry;
+        // an already-held sender can still settle the protected late receipt.
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let remaining = batch
+            .metadata
+            .expires_at_ms
+            .saturating_sub(now)
+            .min(u64::from(policy::SENDER_MS)) as u32;
+        if remaining != 0 {
+            self.lease.renew(remaining)?;
+        }
+        self.finish(
+            Disposition::Count {
+                original: batch.count(),
+                accepted,
+            },
+            batch,
+        )
+        .await
     }
     pub async fn failed(&self, batch: &Batch) -> Result<Health, Error> {
         self.finish(Disposition::Failed, batch).await

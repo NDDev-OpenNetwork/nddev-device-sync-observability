@@ -75,6 +75,7 @@ pub(crate) enum Command {
 #[derive(Clone, Copy)]
 pub(crate) enum Disposition {
     Delivered,
+    Count { original: u32, accepted: i64 },
     Dropped,
     Failed,
 }
@@ -132,6 +133,13 @@ impl Command {
                 validate_health(traces)?;
             }
             _ => {}
+        }
+        if let Self::Finish {
+            disposition: Disposition::Count { original, accepted },
+            ..
+        } = self
+        {
+            crate::feed::settlement(*original, *accepted)?;
         }
         if !matches!(self, Self::Append(_)) && bytes != 0 {
             return Err(Error);
@@ -233,10 +241,25 @@ fn remove(
     {
         return Err(Error);
     }
+    let partial = match disposition {
+        Disposition::Count { original, accepted } => {
+            if original != count {
+                return Err(Error);
+            }
+            Some(crate::feed::settlement(original, accepted)?)
+        }
+        Disposition::Delivered => Some(crate::feed::settlement(count, i64::from(count))?),
+        _ => None,
+    };
     health.pending -= count;
     match disposition {
         Disposition::Delivered => increment(&mut health.delivered, u64::from(count)),
         Disposition::Dropped => increment(&mut health.dropped, u64::from(count)),
+        Disposition::Count { .. } => {
+            let (delivered, dropped) = partial.ok_or(Error)?;
+            increment(&mut health.delivered, u64::from(delivered));
+            increment(&mut health.dropped, u64::from(dropped));
+        }
         Disposition::Failed => return Err(Error),
     }
     global.records -= count;
@@ -465,7 +488,9 @@ pub(crate) fn decide(
                         &mut global,
                         &mut changed,
                     )?;
-                    if matches!(disposition, Disposition::Delivered) {
+                    if matches!(disposition, Disposition::Delivered)
+                        || matches!(disposition, Disposition::Count { original, accepted } if i64::from(*original) == *accepted)
+                    {
                         scopes.get_mut(scope).ok_or(Error)?.last_success_at = snapshot.now / 1000;
                     }
                     deleted.insert(record.metadata.id);
@@ -535,6 +560,52 @@ mod tests {
     }
     fn sender() -> String {
         "00000000-0000-4000-8000-000000000002".into()
+    }
+    #[test]
+    fn count_settlement_validates_before_mutation_and_partial_keeps_full_success_time() {
+        for accepted in [0, 1, 2] {
+            let mut before = snapshot(2);
+            before.lookup = Some(record());
+            before.health[1]["last_success_at"] = 5.into();
+            let request = Command::Finish {
+                sender: sender(),
+                batch: record().metadata.id,
+                disposition: Disposition::Count {
+                    original: 2,
+                    accepted,
+                },
+            };
+            let done = decide(&scope(), &request, 0, before).unwrap();
+            assert_eq!(
+                (
+                    done.result.events.pending,
+                    done.result.events.delivered,
+                    done.result.events.dropped
+                ),
+                (0, accepted as u64, 2 - accepted as u64)
+            );
+            assert_eq!(
+                done.result.last_success_at,
+                if accepted == 2 { 1 } else { 5 }
+            );
+            let mut absent = snapshot(0);
+            absent.health[1]["events"]["delivered"] = accepted.into();
+            absent.health[1]["events"]["dropped"] = (2 - accepted).into();
+            let late = decide(&scope(), &request, 0, absent).unwrap();
+            assert!(late.remove.is_empty());
+            assert_eq!(late.result.events.delivered, accepted as u64);
+        }
+        for accepted in [-1, 3] {
+            let request = Command::Finish {
+                sender: sender(),
+                batch: record().metadata.id,
+                disposition: Disposition::Count {
+                    original: 2,
+                    accepted,
+                },
+            };
+            assert!(decide(&scope(), &request, 0, snapshot(0)).is_err());
+        }
     }
     #[test]
     fn original_store_receipt_is_counted_once_and_removed_bytes_are_exact() {
