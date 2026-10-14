@@ -80,8 +80,10 @@ network delivery. The spool binds to the caller's verified origin/owner/device
 scope and stores exact redacted JSON or OTLP bytes. Limits are 8 MiB of encoded payloads, 4096 records
 (and therefore at most 4096 batches) and 16 scopes per origin; batches retain their original 30-minute
 eligibility and durable retry counts. A short in-flight grace permits a bounded
-request to settle. A browser-owned sender lock serializes tabs and is released
-between retries. Unknown outcomes may repeat spans with their original IDs;
+request to settle. A browser-owned sender lock serializes tabs. After a known
+receipt, callers retain the batch/count and retry only local `acknowledge_count`
+settlement; browser freshness comes from returned `Health.last_success_at`.
+Unknown outcomes may repeat spans with their original IDs;
 this is not an exactly-once delivery claim. Opt-out discards the scoped queue.
 Counters distinguish queued, durably acknowledged, discarded and failed work.
 The SDK owns durable-spool admission, expiry and receipt accounting in Rust.
