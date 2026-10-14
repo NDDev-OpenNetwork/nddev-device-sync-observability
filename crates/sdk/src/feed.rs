@@ -83,6 +83,15 @@ impl State {
         }
     }
 }
+/// Validate an opaque batch's transport count before any health mutation.
+pub(crate) fn settlement(count: u32, accepted: i64) -> Result<(u32, u32), Error> {
+    let accepted = u32::try_from(accepted).map_err(|_| Error)?;
+    if accepted > count {
+        return Err(Error);
+    }
+    Ok((accepted, count - accepted))
+}
+
 pub struct ExportFeed(Arc<Mutex<State>>);
 pub struct ExportBatch {
     state: Arc<Mutex<State>>,
@@ -116,22 +125,38 @@ impl ExportBatch {
     /// Ownership moved to committed browser storage; this is not delivery.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn persisted(mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.inflight -= self.count;
         self.settled = true;
     }
     pub fn acknowledge(mut self) {
+        self.acknowledge_count(i64::from(self.count))
+            .expect("full batch count");
+    }
+    /// A transport accepted count settles the original batch once. Rejected
+    /// records are counted as dropped; this never reserializes or retries bytes.
+    /// Invalid counts leave ownership and health unchanged for caller handling.
+    pub fn acknowledge_count(&mut self, accepted: i64) -> Result<(), Error> {
+        let (delivered, dropped) = settlement(self.count, accepted)?;
+        if self.settled {
+            return Ok(());
+        }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.inflight -= self.count;
         state.delivered = state
             .delivered
-            .saturating_add(u64::from(self.count))
+            .saturating_add(u64::from(delivered))
             .min(MAX_COUNTER);
+        state.discard(dropped);
         self.settled = true;
+        Ok(())
     }
 }
 impl Drop for ExportBatch {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.inflight -= self.count;
         if !self.settled {
+            state.inflight -= self.count;
             state.discard(self.count);
         }
     }
@@ -271,6 +296,70 @@ mod tests {
     use super::*;
     fn event(router: &Router) {
         router.enqueue(&serde_json::Map::new());
+    }
+    #[test]
+    fn accepted_count_settles_owned_native_batch_once_without_changing_bytes() {
+        for accepted in [0, 1, 2] {
+            let router = Router::default();
+            let feed = router.subscribe().unwrap();
+            event(&router);
+            event(&router);
+            let mut batch = feed.take_batch().unwrap();
+            let bytes = batch.bytes().to_vec();
+            assert_eq!(feed.health().pending, 2);
+            for invalid in [-1, 3] {
+                assert!(batch.acknowledge_count(invalid).is_err());
+                let health = feed.health();
+                assert_eq!(
+                    (health.pending, health.delivered, health.dropped),
+                    (2, 0, 0)
+                );
+                assert_eq!(batch.bytes(), bytes);
+            }
+            batch.acknowledge_count(accepted).unwrap();
+            batch.acknowledge_count(accepted).unwrap();
+            assert_eq!(batch.bytes(), bytes);
+            drop(batch);
+            let health = feed.health();
+            assert_eq!(
+                (health.pending, health.delivered, health.dropped),
+                (0, accepted as u64, 2 - accepted as u64)
+            );
+        }
+    }
+    #[test]
+    fn native_optout_expiry_and_unknown_drop_keep_original_ownership_totals() {
+        let router = Router::default();
+        let feed = router.subscribe().unwrap();
+        event(&router);
+        event(&router);
+        let mut batch = feed.take_batch().unwrap();
+        event(&router);
+        feed.set_enabled(false);
+        assert_eq!((feed.health().pending, feed.health().dropped), (2, 1));
+        batch.created = Instant::now() - RETENTION;
+        assert!(batch.expired());
+        batch.acknowledge_count(1).unwrap();
+        drop(batch);
+        assert_eq!(
+            (
+                feed.health().pending,
+                feed.health().delivered,
+                feed.health().dropped
+            ),
+            (0, 1, 2)
+        );
+        feed.set_enabled(true);
+        event(&router);
+        drop(feed.take_batch().unwrap());
+        assert_eq!(
+            (
+                feed.health().pending,
+                feed.health().delivered,
+                feed.health().dropped
+            ),
+            (0, 1, 3)
+        );
     }
     #[test]
     fn startup_is_claimed_once_and_cannot_cross_a_replacement_owner() {

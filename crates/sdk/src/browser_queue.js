@@ -24,16 +24,24 @@ export function releaseSender(id) {
   const lease=senders.get(id);
   if(lease){senders.delete(id);clearTimeout(lease.timer);lease.release();}
 }
+export function renewSender(scope,id,timeout) {
+  const lease=senders.get(id),now=performance.now();
+  if(!lease?.held||lease.scope!==scope||lease.deadline<=now)return false;
+  lease.deadline=Math.max(lease.deadline,now+timeout);
+  clearTimeout(lease.timer);
+  lease.timer=setTimeout(()=>releaseSender(id),lease.deadline-now);
+  return true;
+}
 export function acquireSender(scope,id,timeout) {
   if(senders.has(id)||!navigator.locks)return Promise.reject(failure());
   return new Promise((resolve,reject)=>{
     let release;const held=new Promise(done=>{release=done;});
-    const lease={scope,release};senders.set(id,lease);
+    const lease={scope,release,deadline:performance.now()+timeout};senders.set(id,lease);
     lease.timer=setTimeout(()=>{releaseSender(id);reject(failure());},timeout);
     navigator.locks.request('nds-telemetry-send:'+scope,{ifAvailable:true},async lock=>{
       if(!lock){releaseSender(id);resolve(false);return;}
       if(senders.get(id)!==lease)throw failure();
-      resolve(true);await held;
+      lease.held=true;resolve(true);await held;lease.held=false;
     }).catch(()=>{releaseSender(id);reject(failure());});
   });
 }
@@ -63,7 +71,7 @@ export async function queueOperation(encoded,input,policy) {
     // separates the synchronous Rust decision from issuing its mutations.
     const plan=JSON.parse(policy(JSON.stringify({now,health:values,record_count:count,
       expired:expired.map(metadata),records:rows.map(metadata),lookup:lookup?metadata(lookup):null,
-      held_scope:read.sender?(senders.get(read.sender)?.scope??null):null})));
+      held_scope:read.sender&&senders.get(read.sender)?.held?senders.get(read.sender).scope:null})));
     for(const id of plan.remove)records.delete(id);
     for(const row of plan.put)records.put({...loaded.get(row.id),...row});
     if(plan.append)records.add({...plan.append,bytes});
