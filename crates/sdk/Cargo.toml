@@ -40,7 +40,7 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 js-sys = "=0.3.106"
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "=0.4.79"
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 futures = "0.3"
 web-time = "1.1"
 uuid = { version = "1.27", features = ["js"] }

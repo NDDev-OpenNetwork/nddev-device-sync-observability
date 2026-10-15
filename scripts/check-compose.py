@@ -23,13 +23,14 @@ import urllib.request
 import uuid
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+TARGET=pathlib.Path(os.environ.get("CARGO_TARGET_DIR", ROOT/"target"))
 SERVER_LOCK=tomllib.loads((ROOT/'acceptance-server.lock').read_text())
 assert SERVER_LOCK['source_repo']=='NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-server'
 SERVER_SOURCE=SERVER_LOCK['source_commit']
 assert re.fullmatch('[a-f0-9]{40}',SERVER_SOURCE)
 SERVER_IMAGE='nds-server-acceptance:'+SERVER_SOURCE[:12]
 OBS_IMAGE='nds-observability-acceptance:local'
-DEBIAN='debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587'
+DEBIAN='debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f'
 PG='postgres:18.6-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c'
 
 class CommandFailure(AssertionError):
@@ -120,8 +121,8 @@ def main():
         archive=subprocess.check_output(['git','-C',os.environ.get('NDS_SERVER_SOURCE_DIR',str(ROOT.parent/'nddev-device-sync-server')),'archive',SERVER_SOURCE])
         with tarfile.open(fileobj=io.BytesIO(archive)) as tree:tree.extractall(server_dir,filter='data')
         if command('docker','image','inspect',SERVER_IMAGE,check=False).returncode:
-            command('docker','build','--tag',SERVER_IMAGE,'--build-arg','NDS_SOURCE_COMMIT='+SERVER_SOURCE,str(server_dir),timeout=300)
-        command('docker','build','--tag',OBS_IMAGE,str(ROOT),timeout=300)
+            command('docker','build','--tag',SERVER_IMAGE,'--build-arg','NDS_SOURCE_COMMIT='+SERVER_SOURCE,str(server_dir),timeout=900)
+        command('docker','build','--tag',OBS_IMAGE,str(ROOT),timeout=900)
         override={'services':{
             'observability':{'environment':{'NDS_EXPECTED_SOURCES':','.join(source_names)}},
             'probe':{'image':OBS_IMAGE,'entrypoint':['sleep','infinity'],'read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'mem_limit':'32m','pids_limit':16,'networks':['pipeline']},
@@ -145,7 +146,8 @@ def main():
             # Only this uniquely named, test-owned volume requires initial UID setup.
             command('docker','volume','create',project+'_oo_data')
             command('docker','run','--rm','--network','none','--user','0','--cap-drop','ALL','--cap-add','CHOWN','--security-opt','no-new-privileges:true','--mount',f'type=volume,src={project}_oo_data,dst=/data',DEBIAN,'chown','10001:10001','/data')
-            compose('up','--detach','openobserve','vector','postgres','server-postgres','probe')
+            compose('pull','openobserve','vector','postgres','server-postgres',timeout=900)
+            compose('up','--detach','openobserve','vector','postgres','server-postgres','probe',timeout=120)
             global PROBE
             PROBE=service_id('probe')
             oo=endpoint('openobserve',5080)
@@ -213,7 +215,7 @@ def main():
             # The records come from the actual shared Rust producer, not hand-
             # assembled successful payloads. Ingress -> Vector -> OpenObserve
             # and the durable incident machine consume exactly those records.
-            produced=command(ROOT/'target/debug/examples/sdk_probe','--client-cycle',timeout=5)
+            produced=command(TARGET/'debug/examples/sdk_probe','--client-cycle',timeout=5)
             assert len(produced.stdout.encode())<=128*1024
             cycle=[json.loads(line) for line in produced.stdout.splitlines()]
             ready_index=next(i for i,event in enumerate(cycle) if event['event.name']=='client.ready')
@@ -276,7 +278,7 @@ def main():
             assert code==400
             assert sql('postgres',"SELECT count(*) FROM sources WHERE service_name='nddev-device-sync-agent."+hashlib.sha256(late_device.encode()).hexdigest()[:24]+"'")=='0'
             assert sql('postgres',"SELECT last_sequence FROM client_producers WHERE instance_id='"+late_instance+"'::uuid")==str(later['producer.sequence'])
-            recovered=command(ROOT/'target/debug/examples/sdk_probe','--client-cycle',timeout=5)
+            recovered=command(TARGET/'debug/examples/sdk_probe','--client-cycle',timeout=5)
             recovery=next(event for line in recovered.stdout.splitlines() if (event:=json.loads(line))['event.name']=='client.ready')
             recovery=recovery | {'service.name':'nddev-device-sync-client','device.id':late_device,'producer.instance_id':str(uuid.uuid5(uuid.NAMESPACE_OID,recovery['producer.instance_id']+late_device))}
             assert ingest([recovery])['accepted']==1
