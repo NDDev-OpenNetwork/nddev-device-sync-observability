@@ -95,7 +95,7 @@ services:
     ports: ['127.0.0.1:${NDS_FLUENT_PORT:?required}:24224']
     networks: [pipeline,collector]
   openobserve:
-    image: public.ecr.aws/zinclabs/openobserve:v1.0.4@sha256:d4a878fac1f6c56003764f7f2a1625668917388f167e222c8c810de3f54c56ba
+    image: public.ecr.aws/zinclabs/openobserve:v1.1.0@sha256:e4d0022fde1d51c15a7ec845f53d5aa69ecec5ad636f77d57cffd50c98a02ed7
     user: '10001:10001'
     read_only: true
     cap_drop: [ALL]
