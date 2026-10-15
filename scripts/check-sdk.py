@@ -5,8 +5,9 @@ import json
 import pathlib
 import subprocess
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+TARGET=pathlib.Path(os.environ.get("CARGO_TARGET_DIR", ROOT/"target"))
 subprocess.run(['cargo','build','--locked','-p','nddev-device-sync-telemetry','--example','sdk_probe'],cwd=ROOT,check=True)
-result=subprocess.run([ROOT/'target/debug/examples/sdk_probe'],capture_output=True,check=True,timeout=5)
+result=subprocess.run([TARGET/'debug/examples/sdk_probe'],capture_output=True,check=True,timeout=5)
 assert len(result.stdout)<128*1024
 records=[json.loads(line) for line in result.stdout.splitlines()]
 assert len(records)==48
@@ -29,7 +30,7 @@ print('SDK actual process: ordered canonical events, typed client failures, real
 
 # Producers race the terminal close against a real, actively drained pipe.
 # Every attempted record is observed or explicitly counted as lost.
-race=subprocess.run([ROOT/'target/debug/examples/sdk_probe','--shutdown-race'],capture_output=True,check=True,timeout=10)
+race=subprocess.run([TARGET/'debug/examples/sdk_probe','--shutdown-race'],capture_output=True,check=True,timeout=10)
 assert len(race.stdout)<16*1024*1024
 evidence=json.loads(race.stderr)
 received=[json.loads(line) for line in race.stdout.splitlines()]
@@ -38,7 +39,7 @@ assert evidence['pending']==0
 assert sum(event['event.name']=='process.stopped' for event in received)<=1
 print('SDK concurrent shutdown: all attempted records delivered locally or counted lost, zero pending, idempotent close')
 
-panic=subprocess.run([ROOT/'target/debug/examples/sdk_probe','--panic'],capture_output=True,timeout=5)
+panic=subprocess.run([TARGET/'debug/examples/sdk_probe','--panic'],capture_output=True,timeout=5)
 assert panic.returncode != 0 and not panic.stderr
 assert b'SYNTHETIC_PRIVATE_PANIC' not in panic.stdout and b'/private/example' not in panic.stdout
 failed=[json.loads(line) for line in panic.stdout.splitlines()]
@@ -47,7 +48,7 @@ print('SDK real Rust panic: canonical fatal class, no raw payload/stack/default 
 
 # This pipe deliberately remains undrained until after the child exits. The
 # worker may block in the OS; caller work and Logger::drop must still finish.
-blocked=subprocess.Popen([ROOT/'target/debug/examples/sdk_probe','--blocked-stdout'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+blocked=subprocess.Popen([TARGET/'debug/examples/sdk_probe','--blocked-stdout'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 try:
     assert blocked.wait(timeout=6)==0
     evidence=json.loads(blocked.stderr.read(4096))
@@ -57,7 +58,7 @@ finally:
     if blocked.poll() is None:blocked.kill();blocked.wait(timeout=2)
     blocked.stdout.close();blocked.stderr.close()
 
-cli=subprocess.run([ROOT/'target/debug/examples/sdk_probe','--stderr'],capture_output=True,check=True,timeout=5)
+cli=subprocess.run([TARGET/'debug/examples/sdk_probe','--stderr'],capture_output=True,check=True,timeout=5)
 assert json.loads(cli.stdout)=={'result':'ok'}
 assert len(cli.stderr)<128*1024
 cli_events=[json.loads(line) for line in cli.stderr.splitlines()]
@@ -66,7 +67,7 @@ assert any(event['event.name']=='process.stopped' for event in cli_events)
 print('SDK CLI output: one stdout result, canonical lifecycle diagnostics on bounded stderr')
 
 if os.name == 'posix':
-    unavailable=subprocess.run([ROOT/'target/debug/examples/sdk_probe','--closed-stdout-panic'],capture_output=True,timeout=5)
+    unavailable=subprocess.run([TARGET/'debug/examples/sdk_probe','--closed-stdout-panic'],capture_output=True,timeout=5)
     assert unavailable.returncode != 0
     assert not unavailable.stdout and not unavailable.stderr
     print('SDK unavailable sink: subsequent real panic exposes neither payload nor stack')
