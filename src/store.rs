@@ -344,7 +344,7 @@ impl Repository for PgRepository {
                 // Device-bound client sources have no always-on liveness promise.
                 // Producer rows separate concurrent app/CLI streams on one device.
                 use sha2::{Digest, Sha256};
-                let digest = format!("{:x}", Sha256::digest(device.as_bytes()));
+                let digest = base16ct::lower::encode_string(&Sha256::digest(device.as_bytes()));
                 let service = format!("{}.{}", event.service, &digest[..24]);
                 let known: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM sources WHERE tenant_id=$1 AND service_name=$2)",
