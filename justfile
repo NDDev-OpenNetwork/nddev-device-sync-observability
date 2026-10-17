@@ -15,7 +15,7 @@ sdk-check:
     python3 scripts/check-sdk.py
 
 sdk-wasm-check:
-    cargo clippy --locked -p nddev-device-sync-telemetry --features client-traces --target wasm32-unknown-unknown -- -D warnings
+    cargo clippy --locked -p nddev-device-sync-telemetry --features client-traces,browser-bindings --target wasm32-unknown-unknown -- -D warnings
 
 protocol-check:
     python3 scripts/check-protocol.py

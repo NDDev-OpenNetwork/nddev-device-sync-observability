@@ -133,5 +133,17 @@ fn main() {
         scope = "io",
         outcome = "ok"
     );
-    tracing::info!(event.name = "process.completed", outcome = "ok");
+    let span = operation_span("organizations", "database").expect("valid company audit scope");
+    let _entered = span.enter();
+    tracing::info!(
+        event.name = "company.command.completed",
+        outcome = "ok",
+        auth_method = "passkey",
+        operation.id = "01900000-0000-7000-8000-000000000001",
+        user.id = "actor-1",
+        target.user.id = "member-2",
+        tenant.id = "company-1",
+        device.id = "device-1",
+        invitation.id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
 }

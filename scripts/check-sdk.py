@@ -11,6 +11,13 @@ result=subprocess.run([TARGET/'debug/examples/sdk_probe'],capture_output=True,ch
 assert len(result.stdout)<128*1024
 records=[json.loads(line) for line in result.stdout.splitlines()]
 assert len(records)==48
+audit=next(event for event in records if event['event.name']=='company.command.completed')
+assert audit['operation.id']=='01900000-0000-7000-8000-000000000001'
+assert audit['user.id']=='actor-1' and audit['target.user.id']=='member-2'
+assert audit['invitation.id']=='A'*43 and audit['tenant.id']=='company-1'
+assert audit['module']=='organizations' and audit['scope']=='database' and audit['auth_method']=='passkey'
+assert len(audit['trace_id'])==32 and len(audit['span_id'])==16
+
 assert [event['producer.sequence'] for event in records]==list(range(1,49))
 assert len({event['producer.instance_id'] for event in records})==1
 assert sum(event['event.name']=='logging.debug.disabled' and event['reason']=='expired' for event in records)==1

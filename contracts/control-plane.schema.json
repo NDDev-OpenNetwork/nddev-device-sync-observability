@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nddev.ai/schemas/nddev-device-sync/v2/control-plane.schema.json",
   "title": "NDS control plane v2 definitions",
-  "$comment": "Planned next implementation contract. It does not claim that v2 endpoints currently exist. Validate a named definition, not this definition-only document.",
+  "$comment": "Versioned identity, enrollment, sync and telemetry contracts. Adoption and runtime acceptance are owned by consuming module pins; schema presence does not claim an implemented endpoint.",
   "$defs": {
     "Identifier": {
       "type": "string",
@@ -37,7 +37,8 @@
       "type": "string",
       "enum": [
         "email_otp",
-        "github"
+        "github",
+        "passkey"
       ]
     },
     "AuthMethods": {
@@ -48,11 +49,15 @@
         },
         "github": {
           "$ref": "#/$defs/MethodAvailability"
+        },
+        "passkey": {
+          "$ref": "#/$defs/MethodAvailability"
         }
       },
       "required": [
         "email_otp",
-        "github"
+        "github",
+        "passkey"
       ],
       "additionalProperties": false
     },
@@ -241,7 +246,8 @@
         "linux",
         "windows",
         "ios",
-        "android"
+        "android",
+        "web"
       ]
     },
     "PublicKey": {
@@ -402,7 +408,14 @@
           "$ref": "#/$defs/Identifier"
         },
         "entity_type": {
-          "$ref": "#/$defs/Identifier"
+          "type": "string",
+          "enum": [
+            "device_state",
+            "module_state",
+            "vault_record",
+            "account_state",
+            "clipboard_item"
+          ]
         },
         "entity_id": {
           "$ref": "#/$defs/LongIdentifier"
@@ -414,13 +427,7 @@
           "$ref": "#/$defs/LongIdentifier"
         },
         "payload": {
-          "type": "object",
-          "maxProperties": 128,
-          "propertyNames": {
-            "type": "string",
-            "maxLength": 128
-          },
-          "description": "Validated against the owning entity schema before append. This envelope does not permit arbitrary entity types or plaintext credentials. The complete UTF-8 request is bounded to 65536 bytes and nesting depth to 32 by the HTTP adapter."
+          "$ref": "#/$defs/EncryptedPayload"
         }
       },
       "required": [
@@ -558,6 +565,7 @@
           "enum": [
             "invalid_request",
             "authentication_failed",
+            "recent_authentication_required",
             "authorization_denied",
             "method_unavailable",
             "challenge_expired",
@@ -571,7 +579,9 @@
             "revision_exhausted",
             "dependency_unavailable",
             "server_busy",
-            "request_timeout"
+            "sync_capacity_exhausted",
+            "request_timeout",
+            "vault_key_registration_required"
           ]
         }
       },
@@ -611,6 +621,287 @@
         "decision"
       ],
       "additionalProperties": false
+    },
+    "EncryptedPayload": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "const": "aes-256-gcm"
+        },
+        "key_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "nonce": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 16,
+          "pattern": "^[A-Za-z0-9_-]{16}(?![\\s\\S])"
+        },
+        "ciphertext": {
+          "type": "string",
+          "minLength": 22,
+          "maxLength": 21867,
+          "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])",
+          "x-sensitive": true
+        }
+      },
+      "required": [
+        "algorithm",
+        "key_id",
+        "nonce",
+        "ciphertext"
+      ],
+      "additionalProperties": false,
+      "$comment": "Canonical unpadded base64url. Decode nonce to12 bytes and ciphertext to16..16400 bytes. Native AES-256-GCM authenticates owner, entity type/ID and key ID; plaintext never enters the server or telemetry."
+    },
+    "VaultKey": {
+      "type": "object",
+      "description": "Privileged native HTTPS key delivery only. Never expose through Flutter, agent transcripts, metadata stores or telemetry. The server has decryption authority.",
+      "properties": {
+        "key_id": {
+          "type": "string",
+          "format": "uuid",
+          "maxLength": 36
+        },
+        "key_material": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_-]{64}(?![\\s\\S])",
+          "x-sensitive": true,
+          "description": "Canonical unpadded base64url of UUID bytes followed by the 32-byte owner key."
+        }
+      },
+      "required": [
+        "key_id",
+        "key_material"
+      ],
+      "additionalProperties": false
+    },
+    "VaultKeyRequest": {
+      "type": "object",
+      "properties": {
+        "existing_key": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/VaultKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "existing_key"
+      ],
+      "additionalProperties": false
+    },
+    "PasskeyStart": {
+      "type": "object",
+      "properties": {
+        "flow_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "authorization_url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "format": "uri"
+        },
+        "exchange_token": {
+          "$ref": "#/$defs/OpaqueToken"
+        },
+        "expires_in_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        },
+        "poll_after_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        },
+        "verification_code": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 8,
+          "pattern": "^[0-9]{8}(?![\\s\\S])",
+          "description": "Comparison code displayed by the initiating app and browser approval page; not a bearer credential or email OTP."
+        }
+      },
+      "required": [
+        "flow_id",
+        "authorization_url",
+        "exchange_token",
+        "expires_in_seconds",
+        "poll_after_seconds",
+        "verification_code"
+      ],
+      "additionalProperties": false,
+      "description": "Bounded native/browser WebAuthn handoff. Exchange token remains native; the browser proves authenticator possession and user verification before delivery."
+    },
+    "PasskeyRequest": {
+      "type": "object",
+      "properties": {
+        "registration": {
+          "type": "boolean"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254,
+          "format": "email",
+          "x-sensitive": true,
+          "description": "Login account selector, never authentication. Omit for registration, which uses the authenticated session. Omission at login is accepted only when exactly one active account exists."
+        }
+      },
+      "required": [
+        "registration"
+      ],
+      "additionalProperties": false
+    },
+    "PasskeyStatus": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "registered"
+          ]
+        },
+        "retry_after_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30
+        }
+      },
+      "required": [
+        "status",
+        "retry_after_seconds"
+      ],
+      "additionalProperties": false
+    },
+    "PasskeyInfo": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "created_at"
+      ],
+      "additionalProperties": false
+    },
+    "PasskeyList": {
+      "type": "object",
+      "properties": {
+        "passkeys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PasskeyInfo"
+          },
+          "maxItems": 16
+        }
+      },
+      "required": [
+        "passkeys"
+      ],
+      "additionalProperties": false
+    },
+    "PasskeyRevocation": {
+      "type": "object",
+      "properties": {
+        "current_session_revoked": {
+          "type": "boolean"
+        },
+        "passkey_available": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "current_session_revoked",
+        "passkey_available"
+      ],
+      "additionalProperties": false
+    },
+    "BrowserSessionIssued": {
+      "type": "object",
+      "description": "Same-origin browser session result. The credential is delivered only through the Secure HttpOnly host-only session cookie.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/Session"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "additionalProperties": false
+    },
+    "BrowserCapabilities": {
+      "type": "object",
+      "properties": {
+        "session_mode": {
+          "type": "string",
+          "enum": [
+            "cookie"
+          ]
+        },
+        "device_platform": {
+          "type": "string",
+          "enum": [
+            "web"
+          ]
+        },
+        "replica_protocol": {
+          "type": "integer",
+          "const": 2
+        }
+      },
+      "required": [
+        "session_mode",
+        "device_platform",
+        "replica_protocol"
+      ],
+      "additionalProperties": false
+    },
+    "InvitationEmailChallengeRequest": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254,
+          "format": "email",
+          "x-sensitive": true
+        },
+        "invitation_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "invitation_token": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$",
+          "x-sensitive": true
+        }
+      },
+      "required": [
+        "email",
+        "invitation_id",
+        "invitation_token"
+      ],
+      "additionalProperties": false,
+      "description": "Begin normal email verification for the intended recipient of a live invitation. Invitation possession alone never activates membership or creates a session."
     }
   }
 }

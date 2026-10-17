@@ -5,7 +5,7 @@ channel: alpha
 license: AGPL-3.0-only
 repository: NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability
 standards_lock: standarts.lock
-protocol_commit: b80dea717e305d8311e40e7428cc9fe4365401c9
+protocol_commit: f9d3ff18ed2936088e91a243cc4fe9884965c92a
 packages:
   telemetry: crates/sdk
 platforms:
