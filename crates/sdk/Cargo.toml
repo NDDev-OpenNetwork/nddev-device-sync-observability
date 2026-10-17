@@ -7,6 +7,7 @@ license = "AGPL-3.0-only"
 
 [features]
 default = []
+browser-bindings = ["dep:tsify"]
 client-traces = ["dep:prost", "dep:opentelemetry-proto"]
 otlp = ["dep:opentelemetry-otlp", "dep:url", "dep:reqwest", "dep:rustls"]
 
@@ -37,6 +38,7 @@ prost = "0.14"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
 js-sys = "=0.3.106"
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "=0.4.79"

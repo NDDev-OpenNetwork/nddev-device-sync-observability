@@ -697,7 +697,7 @@ impl<W: Write> Control<W> {
         }
     }
 
-    /// Native presentation supplies a closed class, never an exception or stack.
+    /// Presentation supplies a closed class, never an exception or stack.
     /// This records an actual reporting operation; it does not reconstruct a
     /// missing application span or promise collection/delivery.
     pub fn report_failure(&self, kind: view::FailureKind) {
@@ -1332,9 +1332,14 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::error!(event.name="operation.failed",error.type="private:class",outcome="error");
             control.report_failure(view::FailureKind::FlutterFramework);
+            control.report_failure(view::FailureKind::ReactRender);
+            control.report_failure(view::FailureKind::BrowserUnhandled);
         });
         let emitted = records(&bytes);
         assert_eq!(emitted[0]["error.type"], "redacted_error");
+        assert_eq!(emitted[2]["error.type"], "react_render_error");
+        assert_eq!(emitted[3]["error.type"], "browser_unhandled_error");
+        assert_eq!(emitted.len(), 4);
         for value in &emitted {
             let decoded = decode_event(value.clone()).unwrap();
             assert_eq!(serde_json::to_value(decoded).unwrap(), *value);
