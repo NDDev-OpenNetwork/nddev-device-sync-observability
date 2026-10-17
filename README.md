@@ -116,8 +116,10 @@ services remain internal. Runtime memory caps fit an 8 GiB single-node plan.
 Persistent deployment additionally needs approved filesystem quotas for data
 volumes. There is no deployment, backup or recovery command in this module.
 
-Vector 0.59.0 (MPL-2.0), OpenObserve 1.0.4 (AGPL-3.0) and PostgreSQL 18.6 images
-are pinned by manifest digest in `deploy/compose.yaml`. Vector uses its native
+Vector 0.59.0 (MPL-2.0), OpenObserve 1.1.0 (AGPL-3.0) and PostgreSQL 18.6 images
+are pinned by manifest digest in `deploy/compose.yaml`. OpenObserve comes from
+the [publisher's registry](https://openobserve.ai/downloads/) with the same OSS
+manifest digest previously qualified from ECR. Vector uses its native
 directory secret backend, without environment interpolation. OpenObserve vendor
 telemetry, model pricing synchronization and GeoIP downloads are disabled.
 OpenObserve retention is three days; the Rust outbox is capped at 4,096 events

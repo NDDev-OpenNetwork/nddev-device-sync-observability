@@ -348,6 +348,14 @@ struct Shared<W> {
     config: Config,
 }
 impl<W: Write> Shared<W> {
+    fn owns_target(&self, target: &str) -> bool {
+        self.config.target_prefixes.iter().any(|prefix| {
+            target == prefix
+                || target
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with("::"))
+        })
+    }
     fn prepare(&self, mut fields: Map<String, Value>, severity: &str) -> Map<String, Value> {
         for (key, value) in &self.policy.base {
             if key != "module" || !fields.contains_key(key) {
@@ -536,17 +544,26 @@ where
                     }),
                 ..Fields::default()
             };
-            attrs.record(&mut Visitor {
-                fields: &mut fields,
-                policy: &self.shared.policy,
-                sdk_http_span: attrs.metadata().target() == "nds_telemetry"
-                    && attrs.metadata().name() == "http.request",
-            });
+            // Dependency spans are not NDS producers. Keep only suppression
+            // ancestry through them; neither their fields nor rejection counts
+            // may relabel or multiply events from an owned nested operation.
+            if attrs.metadata().target() == "nds_telemetry"
+                || self.shared.owns_target(attrs.metadata().target())
+            {
+                attrs.record(&mut Visitor {
+                    fields: &mut fields,
+                    policy: &self.shared.policy,
+                    sdk_http_span: attrs.metadata().target() == "nds_telemetry"
+                        && attrs.metadata().name() == "http.request",
+                });
+            }
             span.extensions_mut().insert(fields);
         }
     }
     fn on_record(&self, id: &Id, record: &Record<'_>, ctx: LayerContext<'_, S>) {
         if let Some(span) = ctx.span(id)
+            && (span.metadata().target() == "nds_telemetry"
+                || self.shared.owns_target(span.metadata().target()))
             && let Some(fields) = span.extensions_mut().get_mut::<Fields>()
         {
             record.record(&mut Visitor {
@@ -558,14 +575,7 @@ where
     }
     fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {
         let metadata = event.metadata();
-        let owned = self.shared.config.target_prefixes.iter().any(|prefix| {
-            metadata.target() == prefix
-                || metadata
-                    .target()
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with("::"))
-        });
-        if !owned {
+        if !self.shared.owns_target(metadata.target()) {
             return;
         }
         let mut fields = Fields::default();
@@ -593,7 +603,12 @@ where
         {
             return;
         }
-        if let Some(span) = ctx.event_span(event) {
+        // Only SDK spans enter the trace exporter. A dependency span may sit
+        // between an owned event and its canonical operation/request context.
+        if let Some(span) = ctx
+            .event_scope(event)
+            .and_then(|mut scope| scope.find(|span| span.metadata().target() == "nds_telemetry"))
+        {
             let context = self
                 .dispatch
                 .get()
@@ -682,7 +697,7 @@ impl<W: Write> Control<W> {
         }
     }
 
-    /// Native presentation supplies a closed class, never an exception or stack.
+    /// Presentation supplies a closed class, never an exception or stack.
     /// This records an actual reporting operation; it does not reconstruct a
     /// missing application span or promise collection/delivery.
     pub fn report_failure(&self, kind: view::FailureKind) {
@@ -1224,6 +1239,50 @@ mod tests {
         assert_eq!(control.rejected_fields_or_events(), 4);
     }
 
+    #[test]
+    fn foreign_spans_cannot_inject_fields_or_rejections_into_owned_events() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder().build();
+        let (subscriber, control) =
+            subscriber(config(), Capture(bytes.clone()), provider.tracer("test")).unwrap();
+        let feed = control.subscribe().unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            let owner = operation_span("accounts", "io").unwrap();
+            owner.in_scope(|| {
+                let foreign = tracing::info_span!(target: "foreign_transport", "connect",
+                    module = "rds", op = "PRIVATE_TRANSPORT_DETAIL");
+                foreign.in_scope(|| {
+                    tracing::info!(event.name = "identity.credential.read", outcome = "ok");
+                    foreign.record("module", "vault");
+                    tracing::info!(event.name = "identity.offline.fence", outcome = "ok");
+                });
+            });
+            assert_eq!(feed.health().pending, 2);
+            // The SDK's delivery suppression still crosses foreign ancestors.
+            delivery_span().in_scope(|| {
+                tracing::info_span!(target: "foreign_transport", "delivery", op = "PRIVATE_TRANSPORT_DETAIL")
+                    .in_scope(|| operation_span("accounts", "io").unwrap().in_scope(|| {
+                        tracing::info!(event.name = "identity.credential.read", outcome = "ok");
+                    }));
+            });
+            assert_eq!(feed.health().pending, 2);
+        });
+        let values = records(&bytes);
+        assert_eq!(values.len(), 3);
+        for value in values {
+            assert_eq!(value["module"], "accounts");
+            assert_eq!(value["scope"], "io");
+            assert_eq!(value["trace_id"].as_str().unwrap().len(), 32);
+            assert_eq!(value["span_id"].as_str().unwrap().len(), 16);
+        }
+        assert_eq!(control.rejected_fields_or_events(), 0);
+        assert!(
+            !String::from_utf8(bytes.lock().unwrap().clone())
+                .unwrap()
+                .contains("PRIVATE_TRANSPORT")
+        );
+    }
+
     fn config() -> Config {
         Config {
             service: "generated-sdk-acceptance".into(),
@@ -1273,9 +1332,14 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::error!(event.name="operation.failed",error.type="private:class",outcome="error");
             control.report_failure(view::FailureKind::FlutterFramework);
+            control.report_failure(view::FailureKind::ReactRender);
+            control.report_failure(view::FailureKind::BrowserUnhandled);
         });
         let emitted = records(&bytes);
         assert_eq!(emitted[0]["error.type"], "redacted_error");
+        assert_eq!(emitted[2]["error.type"], "react_render_error");
+        assert_eq!(emitted[3]["error.type"], "browser_unhandled_error");
+        assert_eq!(emitted.len(), 4);
         for value in &emitted {
             let decoded = decode_event(value.clone()).unwrap();
             assert_eq!(serde_json::to_value(decoded).unwrap(), *value);

@@ -1,7 +1,7 @@
 // Generated; do not edit. AGPL-3.0-only. NDDev OpenNetwork — https://nddev.ai
-// Source: NDDev-OpenNetwork/nddev-device-sync-protocol/contracts/v2/telemetry-event.schema.json
-// Schema SHA-256: 149e329eec36d188002b94573ecbc2654b3cf808c1dafbe6fbe00b445c385fa2
-// Generator script SHA-256: 7bc9a3eb58f85fbefaea8170a5625af6258acbf3ff797fe56e30cafbaee3b6ee
+// Source: NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol/contracts/v2/telemetry-event.schema.json
+// Schema SHA-256: 30b2e4e5efde87165d9da30e4e29ddca468423f246d4b98a94daf9318182d01f
+// Generator script SHA-256: 7d4babb41f514c7723ec141ce915844bc6d2b6076e10fb0afcfe5243396fe8d6
 // Tool: quicktype-core 26.0.0; dependency lock SHA-256: 643e0f2ba88602f4acb9546c401d4838e8e106a9180c0e6f3a760985081bfcf6
 // DTO generation is not schema, authorization or cryptographic validation.
 
@@ -69,6 +69,12 @@ pub struct TelemetryEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_available: Option<bool>,
 
+    /// Public invitation identity only. Invitation token, verifier and recipient email remain
+    /// excluded.
+    #[serde(rename = "invitation.id")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invitation_id: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mailbox_delivery: Option<MailboxDelivery>,
 
@@ -83,6 +89,12 @@ pub struct TelemetryEvent {
     pub migration_version: Option<i64>,
 
     pub module: String,
+
+    /// Public operation identity for correlated committed/replayed control actions; never a
+    /// credential.
+    #[serde(rename = "operation.id")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
@@ -142,6 +154,11 @@ pub struct TelemetryEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<i32>,
 
+    /// Explicit target of an administrative action; user.id remains the authenticated actor.
+    #[serde(rename = "target.user.id")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_user_id: Option<String>,
+
     #[serde(rename = "tenant.id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
@@ -166,6 +183,8 @@ pub enum AuthMethod {
     EmailOtp,
 
     Github,
+
+    Passkey,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
