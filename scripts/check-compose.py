@@ -235,6 +235,17 @@ def main():
             observed=eventually(lambda:search('nds','logs',"trace_id='"+failure['trace_id']+"'"))
             assert any(row.get('error_type',row.get('error.type'))=='flutter_framework_error' for row in observed)
             print('Actual shared SDK client failure searchable: one incident, duplicate replay retained, readiness resolved it')
+            audit_output=command(TARGET/'debug/examples/sdk_probe',timeout=5).stdout
+            assert len(audit_output.encode())<=128*1024
+            audit=next(event for event in map(json.loads,audit_output.splitlines()) if event['event.name']=='company.command.completed')
+            assert ingest([audit])['accepted']==1
+            assert ingest([audit])['duplicates']==1
+            indexed=eventually(lambda:search('nds','logs',"trace_id='"+audit['trace_id']+"'"))
+            record=next(row for row in indexed if row.get('event_name',row.get('event.name'))=='company.command.completed')
+            for field in ['operation.id','target.user.id','invitation.id','auth_method']:
+                assert record.get(field.replace('.','_'),record.get(field))==audit[field]
+            print('Actual SDK company audit and passkey method survive canonical ingress, replay deduplication, Vector and OpenObserve search')
+
             # The real SDK's frames pass the same context enrichment boundary
             # supplied by an authenticated gateway, not an always-on source.
             import hashlib
